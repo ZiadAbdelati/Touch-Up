@@ -68,3 +68,21 @@ fastlane/test_output
 # https://github.com/johnno1962/injectionforxcode
 
 iOSInjectionProject/
+
+# Rack integration local builds, installed-app backups, and reference binaries
+build-*/
+original-app/
+replaced-installed-*/
+RackTouchSeizer/rack-touch-seizer*
+Diagnostics/
+Touch.Up.official-v1.1.zip
+*.app/
+*.framework/
+*.o
+*.dSYM/
+
+# Local service configuration and Python artifacts
+config.json
+.venv/
+__pycache__/
+*.pyc

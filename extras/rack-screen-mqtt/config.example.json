@@ -1,0 +1,14 @@
+{
+  "broker": {
+    "host": "",
+    "port": 1883,
+    "username": "",
+    "password": "",
+    "tls": false,
+    "ca_path": ""
+  },
+  "ddc": {
+    "path": "/usr/local/bin/ddcctl"
+  },
+  "poll_seconds": 60
+}

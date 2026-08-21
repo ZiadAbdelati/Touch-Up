@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 void OpenHIDManager(void *delegate);
 
@@ -19,5 +20,9 @@ void CloseHIDManager(void);
 /// macOS and other apps stop receiving their events — Touch Up becomes the sole handler.
 /// Applies to currently-connected and future devices. Pen interfaces stay shared.
 void SetTouchDevicesSeized(bool seize);
+
+/// Runtime USB topology identifier reported by the privileged RackTouchSeizer.
+/// Zero means that the helper has not delivered a packet yet.
+uint32_t RackTouchCurrentLocationID(void);
 
 #endif /* HIDInterpreter_h */

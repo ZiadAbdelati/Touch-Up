@@ -1,41 +1,121 @@
-# Touch-Up
-**Universal user-level driver to support touchscreens on macOS**
-<hr/>
+# Touch Up — GeekPi rack-display integration
 
-Most current touchscreens work with Microsoft Windows out-of-the-box as they implement a standardized communication via USB HID. However, nothing happens when connecting these screens to a Mac.
-The goal of Touch Up was to provide a simple, general-purpose driver that enables plug-and-play support for touchscreens on macOS. 
-The code in this repository provides a user-space driver that reads and processes the HID data into a set of touches and different utilities to inject mouse events into the system.
+This is a hardware-specific fork of Sebastian Hueber's MIT-licensed
+[Touch Up](https://github.com/shueber/Touch-Up). It makes a WCH-based
+GeekPi/DeskPi 2U touchscreen behave as an absolute second-display touchscreen
+on macOS while a JetKVM remains usable as the primary pointer display.
 
-## What can you do with this App?
-The Touch Up **utility app** allows you to control your Mac with any connected touch screen. Touch Up supports clicks, dragging, scrolling, and pinch-to-zoom.
-While the behavior of the driver is customizable, the default setting was inspired by iPadOS:
+The fork is source-only and currently tested on an Intel NUC Hackintosh
+(`x86_64`). It preserves the upstream app and framework, then adds a narrowly
+matched privileged HID helper and rack-specific event path.
 
-- Tap anywhere on the screen to click objects
-- Scroll content by flicking over the screen
-- Drag contents by briefly resting your finger before moving it
-- Zoom content by pinching two fingers
-- Secondary clicks can be performed with two fingers
-- You can even enable touching a window to move it to the front like Stage Manager on iPadOS does
+## What works
 
+- A tap activates the corresponding point on `RTK FHD`, independent of the
+  cursor position on JetKVM.
+- One-finger drag works for Home Assistant sliders.
+- The cursor is hidden during rack interaction and restored to JetKVM.
+- Slider drags are constrained to Accessibility-reported slider bounds, so a
+  release outside a popup does not become a click-away.
+- A watchdog cancels incomplete HID contacts, preventing a stuck drag or
+  trapped cursor after an interrupted report stream.
+- The helper reconnects after app, daemon, or USB restarts.
+- The optional MQTT/DDC companion preserves
+  `number.rack_screen_brightness` in Home Assistant.
 
-### Installing the App
-- Compile the app or [download the latest notarized build here](https://github.com/shueber/Touch-Up/releases).
-- If you wish, move the app into your Applications folder and add it as a Login item.
-- Launch it and allow Accessibility access.
-- Plug in your touchscreen and start touching.
+Pinch-to-zoom is **not available on the tested panel**. The controller advertises
+a ten-contact digitizer report and accepts multitouch mode, but it only emits
+the single-contact mouse-compatible stream on this hardware/macOS combination.
+The experimental parser remains in the source for future firmware testing; it
+does not make this panel multitouch.
 
+## Tested hardware assumptions
 
-### Compatibility
-Touch Up should work with any touchscreen that also works with Windows.
-We used the following screens for testing:
+| Item | Default |
+| --- | --- |
+| Touch controller | WCH `27c0:0859` |
+| Rack display | `RTK FHD`, 1280×400 logical points |
+| Cursor-return display | `JetKVM v1` |
+| Raw calibration | X `166…16249`, Y `180…9264` |
+| macOS architecture | Intel `x86_64` |
 
-- Iiyama TF3222MC and T2336MSC-B2
-- 3M C4667PW
+These defaults live together in `RackTouchProtocol.h`. The USB location ID is
+discovered at runtime, so moving the touchscreen to another USB port no longer
+requires recompiling. The helper also derives the current console user's UID
+and group rather than assuming account 501.
 
+## Components
 
+- `Touch Up/` and `TouchUpCore/`: upstream app/framework plus rack event mapping.
+- `RackTouchSeizer/`: root LaunchDaemon that exclusively captures only the
+  matching WCH mouse/digitizer interfaces and forwards reports through a
+  mode-0600 Unix socket.
+- `RackTouchProtocol.h`: shared packet format and hardware defaults.
+- `extras/rack-screen-mqtt/`: independently installable MQTT/DDC brightness
+  bridge; no broker credentials are stored in this repository.
+- `docs/`: architecture, setup, recovery, and implementation notes.
 
+## Build and install
 
-## The *TouchUpCore* Framework
-Game developers, researchers, and others who need access to all touch data can also benefit from this project by integrating the TouchUpCore **framework** themselves. It provides simple access to all touches recognized on the touch surface, simplifying multitouch prototype development in macOS.
+1. Clone this branch on the target Mac and build the `Touch Up` scheme in
+   Xcode. The app retains the upstream bundle identifiers, so changing signing
+   identities or bundle IDs may require re-granting privacy permissions.
+2. Build and install the helper:
 
-The Touch Up app itself is an example of integrating the TouchUpCore framework. You can have a look at the *DebugView* to see how you can visualize the different touch points. Remember that your app needs an Entitlement to access USB if running in the Sandbox.
+   ```sh
+   ./RackTouchSeizer/build.sh
+   ./RackTouchSeizer/install.sh
+   ```
+
+   `install.sh` recompiles the helper, asks for an administrator password, and
+   installs it under `/Library/PrivilegedHelperTools` with a system
+   LaunchDaemon.
+3. Put the built app in `/Applications`, launch it, and grant both
+   **Accessibility** and **Input Monitoring** in System Settings → Privacy &
+   Security.
+4. In Touch Up settings, confirm the detected touchscreen is mapped to
+   `RTK FHD`. Quit and reopen the app after changing privacy grants.
+5. Test tap and drag with the normal mouse cursor parked on JetKVM.
+
+The app should be added as a Login Item if it is not already started by another
+per-user launcher. The root helper starts automatically at boot and waits until
+a console user is logged in before creating its private socket.
+
+## MQTT/DDC brightness
+
+The companion service is documented in
+[`extras/rack-screen-mqtt/README.md`](extras/rack-screen-mqtt/README.md). Its
+installer copies source into the user's Application Support directory, creates
+a private virtual environment, generates a per-user LaunchAgent, and preserves
+an existing mode-600 configuration.
+
+## Recovery and uninstall
+
+If touch stops or the helper has seized the interface while the app is absent:
+
+```sh
+sudo launchctl bootout system /Library/LaunchDaemons/com.rofkek.rack-touch-seizer.plist
+```
+
+To remove it cleanly:
+
+```sh
+./RackTouchSeizer/uninstall.sh
+```
+
+Useful diagnostics:
+
+```sh
+sudo launchctl print system/com.rofkek.rack-touch-seizer
+ls -l /var/run/com.rofkek.rack-touch-seizer.sock
+tail -F /Library/Logs/com.rofkek.rack-touch-seizer.log
+```
+
+See [`docs/RACK_SCREEN_SETUP.md`](docs/RACK_SCREEN_SETUP.md) for the complete
+permission, testing, troubleshooting, and limitation notes.
+
+## Upstream
+
+The original general-purpose project and documentation are available from
+[shueber/Touch-Up](https://github.com/shueber/Touch-Up). This fork's changes are
+listed in [`CHANGELOG.md`](CHANGELOG.md). The upstream MIT license is retained.

@@ -64,6 +64,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
         )
         
+        // Prevent macOS from simultaneously treating a combo touchscreen HID
+        // interface as a mouse. Without exclusive capture the native event
+        // clicks wherever the existing cursor happens to be, masking Touch
+        // Up's correctly mapped absolute event on another display.
+        self.model.touchManager.setTouchscreensSeized(true)
         self.model.touchManager.start()
         
         
@@ -80,6 +85,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ aNotification: Notification) {
         // Insert code here to tear down your application
         self.model.persistAllDigitizerMappings()
+        self.model.touchManager.setTouchscreensSeized(false)
         self.model.touchManager.stop()
     }
 

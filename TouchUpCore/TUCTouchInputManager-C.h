@@ -21,4 +21,24 @@ void TouchInputManagerDidConnectTouchscreen(void *self, uint32_t locationID);
 
 void TouchInputManagerDidDisconnectTouchscreen(void *self, uint32_t locationID);
 
+// Atomically clicks a rack-screen point, hiding the cursor during the click and
+// restoring it to its previous (typically JetKVM) position immediately after.
+void TouchInputManagerPerformRackTap(void *self, uint32_t locationID, CGFloat x, CGFloat y);
+
+// Synthesizes a rack-screen drag while keeping the cursor hidden. The cursor is
+// restored to its previous (typically JetKVM) position when the drag ends.
+void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y);
+void TouchInputManagerUpdateRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y);
+void TouchInputManagerEndRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y);
+void TouchInputManagerCancelRackDrag(void *self);
+
+// Posts a two-contact magnify gesture at the midpoint of the rack touches
+// without moving the visible system cursor away from JetKVM.
+void TouchInputManagerBeginRackPinch(void *self, uint32_t locationID,
+                                    CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2);
+void TouchInputManagerUpdateRackPinch(void *self, uint32_t locationID,
+                                     CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2);
+void TouchInputManagerEndRackPinch(void *self);
+void TouchInputManagerCancelRackPinch(void *self);
+
 #endif /* TUCTouchInputManager_C_h */

@@ -9,6 +9,8 @@
 
 #import "HIDInterpreter.h"
 #import "TUCCursorUtilities.h"
+#import "../RackTouchProtocol.h"
+#import <dlfcn.h>
 
 @interface TUCTouchInputManager ()
 
@@ -25,6 +27,23 @@
 
 @property TUCCursorGesture identifiedMultitouchGesture;
 
+@property BOOL rackSyntheticDragActive;
+@property CGPoint rackSyntheticDragRestorePoint;
+@property CGPoint rackSyntheticDragLastPoint;
+@property pid_t rackSyntheticDragTargetPID;
+@property int64_t rackSyntheticDragEventNumber;
+@property BOOL rackSyntheticDragConstrained;
+@property CGRect rackSyntheticDragConstraintRect;
+
+@property BOOL rackSyntheticPinchActive;
+@property CGPoint rackSyntheticPinchRestorePoint;
+@property CGPoint rackSyntheticPinchLastPoint;
+@property CGFloat rackSyntheticPinchLastDistance;
+@property pid_t rackSyntheticPinchTargetPID;
+
+@property BOOL rackCursorHideRequested;
+@property NSUInteger rackCursorRestoreGeneration;
+
 @end
 
 
@@ -33,7 +52,25 @@
 #pragma mark   Start & Stop
 
 - (void)start {
-    
+    // Recover from an interrupted synthetic gesture before opening HID again.
+    // This rack installation intentionally keeps the remote-console pointer on
+    // JetKVM whenever Touch Up starts or restarts.
+    CGAssociateMouseAndMouseCursorPosition(true);
+    for (TUCScreen *screen in [TUCScreen allScreens]) {
+        if ([screen.name isEqualToString:kRackTouchRestoreDisplayName]) {
+            CGWarpMouseCursorPosition(CGPointMake(CGRectGetMidX(screen.frame),
+                                                  CGRectGetMidY(screen.frame)));
+            break;
+        }
+    }
+    CGDisplayShowCursor(kCGNullDirectDisplay);
+
+    // This machine's touchscreen exposes a mouse-compatible HID path in
+    // addition to its digitizer path. Seize the accepted digitizer interface
+    // before opening the manager so macOS cannot emit a second click at the
+    // pre-existing cursor position on another display.
+    SetTouchDevicesSeized(true);
+
     __weak id weakSelf = self;
     
     // needs to run on main anyway
@@ -45,6 +82,9 @@
 }
 
 - (void)stop {
+    [self cancelRackSyntheticDrag];
+    [self cancelRackSyntheticPinch];
+    SetTouchDevicesSeized(false);
     CloseHIDManager();
 }
 
@@ -56,6 +96,9 @@
 - (void)didConnectTouchscreenWithLocationID:(uint32_t)locationID {
     self.frameIDsByLocationID[@(locationID)] = @0;
     [self.delegate touchscreenDidConnectWithLocationID:locationID];
+    TUCScreen *screen = [self touchscreenForLocationID:locationID];
+    NSLog(@"Touch Up mapping: 0x%08x -> %@ (%@), frame %@",
+          locationID, screen.name, screen.uuid, NSStringFromRect(screen.frame));
 }
 
 - (void)didDisconnectTouchscreenWithLocationID:(uint32_t)locationID {
@@ -564,8 +607,20 @@
         rotated = devicePoint;
     }
 
-    // Then account for any letterboxing when the content doesn't fill the panel (mirroring
-    // a differently-shaped display). A no-op when the aspect ratios already match.
+    // The GeekPi rack panel is driven as its own 1280x400 display and the raw
+    // four-corner calibration already spans the complete touch glass. Its EDID
+    // also advertises conventional video modes; using the largest advertised
+    // mode here makes the generic aspect-fit code incorrectly treat the top and
+    // bottom of the ultrawide glass as letterbox bars. That collapses roughly
+    // the outer fifths of Y to the screen edges and makes top-row controls
+    // require a touch well below them. Keep rotation, but map this controller's
+    // calibrated glass directly across the full rack display.
+    if (locationID != 0 && locationID == RackTouchCurrentLocationID()) {
+        return rotated;
+    }
+
+    // Then account for any genuine letterboxing when another touchscreen's
+    // content doesn't fill its panel. A no-op when the aspect ratios match.
     return [screen convertGlassPointToContentPoint:rotated];
 }
 
@@ -578,6 +633,14 @@
 
 
 - (TUCScreen *)touchscreenForLocationID:(uint32_t)locationID {
+    if (locationID != 0 && locationID == RackTouchCurrentLocationID()) {
+        for (TUCScreen *screen in [TUCScreen allScreens]) {
+            if ([screen.name isEqualToString:kRackTouchDisplayName]) {
+                return screen;
+            }
+        }
+    }
+
     if (self.delegate != nil) {
         return [self.delegate touchscreenForLocationID:locationID];
     }
@@ -766,6 +829,377 @@ void TouchInputManagerDidConnectTouchscreen(void *self, uint32_t locationID) {
 
 void TouchInputManagerDidDisconnectTouchscreen(void *self, uint32_t locationID) {
     [(__bridge id)self didDisconnectTouchscreenWithLocationID:locationID];
+}
+
+static CGPoint RackTargetPoint(TUCTouchInputManager *manager,
+                               uint32_t locationID,
+                               CGFloat x,
+                               CGFloat y) {
+    CGPoint glassPoint = CGPointMake(x, y);
+    CGPoint relativePoint = [manager convertDigitizerPointToRelativeScreenPoint:glassPoint
+                                                                      locationID:locationID];
+    return [manager convertScreenPointRelativeToAbsolute:relativePoint
+                                               locationID:locationID];
+}
+
+static CGPoint RackSafeRestorePoint(TUCTouchInputManager *manager,
+                                    uint32_t locationID) {
+    TUCCursorUtilities *cursor = [TUCCursorUtilities sharedInstance];
+    CGPoint savedCursorPoint = [cursor currentCursorLocation];
+    TUCScreen *rackScreen = [manager touchscreenForLocationID:locationID];
+    CGPoint restorePoint = savedCursorPoint;
+
+    // WindowServer may process the controller's mouse-compatible event before
+    // the bridged report reaches us. If that already displaced the cursor onto
+    // the rack panel, restore to the centre of JetKVM instead of saving the
+    // contaminated rack coordinate.
+    if (CGRectContainsPoint(rackScreen.frame, savedCursorPoint)) {
+        for (TUCScreen *screen in [TUCScreen allScreens]) {
+            if ([screen.name isEqualToString:kRackTouchRestoreDisplayName]) {
+                restorePoint = CGPointMake(CGRectGetMidX(screen.frame), CGRectGetMidY(screen.frame));
+                break;
+            }
+        }
+    }
+    return restorePoint;
+}
+
+static pid_t RackWindowPIDAtPoint(CGPoint point) {
+    CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                                    kCGWindowListExcludeDesktopElements,
+                                                    kCGNullWindowID);
+    if (!windows) return 0;
+
+    pid_t ownPID = [NSProcessInfo processInfo].processIdentifier;
+    pid_t targetPID = 0;
+    for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+        NSDictionary *window = (__bridge NSDictionary *)CFArrayGetValueAtIndex(windows, index);
+        if ([window[(id)kCGWindowLayer] integerValue] != 0) continue;
+
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)window[(id)kCGWindowBounds],
+                                                    &bounds) ||
+            !CGRectContainsPoint(bounds, point)) continue;
+
+        pid_t candidate = (pid_t)[window[(id)kCGWindowOwnerPID] intValue];
+        if (candidate > 0 && candidate != ownPID) {
+            targetPID = candidate;
+            break;
+        }
+    }
+    CFRelease(windows);
+    return targetPID;
+}
+
+static int64_t RackNextMouseEventNumber(void) {
+    static int64_t eventNumber = 100000;
+    return ++eventNumber;
+}
+
+static BOOL RackSliderBoundsAtPoint(CGPoint point, CGRect *bounds) {
+    AXUIElementRef systemWide = AXUIElementCreateSystemWide();
+    AXUIElementRef element = NULL;
+    AXError error = AXUIElementCopyElementAtPosition(systemWide, point.x, point.y, &element);
+    CFRelease(systemWide);
+    if (error != kAXErrorSuccess || !element) return NO;
+
+    BOOL found = NO;
+    for (NSUInteger depth = 0; depth < 8 && element && !found; depth++) {
+        CFTypeRef roleValue = NULL;
+        if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &roleValue) == kAXErrorSuccess &&
+            roleValue && CFGetTypeID(roleValue) == CFStringGetTypeID() &&
+            CFEqual(roleValue, kAXSliderRole)) {
+            CFTypeRef positionValue = NULL;
+            CFTypeRef sizeValue = NULL;
+            CGPoint origin = CGPointZero;
+            CGSize size = CGSizeZero;
+            if (AXUIElementCopyAttributeValue(element, kAXPositionAttribute, &positionValue) == kAXErrorSuccess &&
+                AXUIElementCopyAttributeValue(element, kAXSizeAttribute, &sizeValue) == kAXErrorSuccess &&
+                positionValue && sizeValue &&
+                CFGetTypeID(positionValue) == AXValueGetTypeID() &&
+                CFGetTypeID(sizeValue) == AXValueGetTypeID() &&
+                AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, &origin) &&
+                AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, &size)) {
+                *bounds = CGRectInset(CGRectMake(origin.x, origin.y, size.width, size.height), 1.0, 1.0);
+                found = !CGRectIsEmpty(*bounds);
+            }
+            if (positionValue) CFRelease(positionValue);
+            if (sizeValue) CFRelease(sizeValue);
+        }
+        if (roleValue) CFRelease(roleValue);
+        if (found) break;
+
+        CFTypeRef parentValue = NULL;
+        if (AXUIElementCopyAttributeValue(element, kAXParentAttribute, &parentValue) != kAXErrorSuccess ||
+            !parentValue || CFGetTypeID(parentValue) != AXUIElementGetTypeID()) {
+            if (parentValue) CFRelease(parentValue);
+            break;
+        }
+        CFRelease(element);
+        element = (AXUIElementRef)parentValue;
+    }
+    if (element) CFRelease(element);
+    return found;
+}
+
+static CGPoint RackConstrainDragPoint(TUCTouchInputManager *manager, CGPoint point) {
+    if (!manager.rackSyntheticDragConstrained) return point;
+    CGRect bounds = manager.rackSyntheticDragConstraintRect;
+    point.x = fmin(fmax(point.x, CGRectGetMinX(bounds)), CGRectGetMaxX(bounds));
+    point.y = fmin(fmax(point.y, CGRectGetMinY(bounds)), CGRectGetMaxY(bounds));
+    return point;
+}
+
+static void RackPostMouseEvent(CGEventType type,
+                               CGPoint point,
+                               int64_t eventNumber,
+                               pid_t targetPID) {
+    (void)targetPID;
+    CGEventRef event = CGEventCreateMouseEvent(NULL, type, point, kCGMouseButtonLeft);
+    if (!event) return;
+    CGEventSetIntegerValueField(event, kCGMouseEventClickState, 1);
+    CGEventSetIntegerValueField(event, kCGMouseEventNumber, eventNumber);
+    CGEventSetDoubleValueField(event, kCGMouseEventPressure,
+                               type == kCGEventLeftMouseUp ? 0.0 : 1.0);
+    // Safari does not consistently accept a complete synthetic drag delivered
+    // with CGEventPostToPid. Post through WindowServer so down/drag/up retain
+    // normal pointer-grab semantics; the cursor stays hidden and is restored
+    // only after the receiving app has consumed mouse-up.
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
+static void RackEnsureCursorHidden(TUCTouchInputManager *manager) {
+    if (manager.rackCursorHideRequested) return;
+
+    // Public cursor hiding normally only affects the foreground process. This
+    // WindowServer connection property is the established compatibility path
+    // used by background remote-input utilities. Resolve it dynamically so a
+    // future macOS version can simply fall back to the public API.
+    typedef int32_t (*RackDefaultConnectionFunction)(void);
+    typedef CGError (*RackSetConnectionPropertyFunction)(int32_t, int32_t,
+                                                          CFStringRef, CFTypeRef);
+    static dispatch_once_t backgroundCursorOnce;
+    dispatch_once(&backgroundCursorOnce, ^{
+        RackDefaultConnectionFunction defaultConnection =
+            (RackDefaultConnectionFunction)dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
+        RackSetConnectionPropertyFunction setConnectionProperty =
+            (RackSetConnectionPropertyFunction)dlsym(RTLD_DEFAULT, "CGSSetConnectionProperty");
+        if (defaultConnection && setConnectionProperty) {
+            int32_t connection = defaultConnection();
+            setConnectionProperty(connection, connection,
+                                  CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
+        }
+    });
+    CGDisplayHideCursor(CGMainDisplayID());
+    manager.rackCursorHideRequested = YES;
+}
+
+static void RackScheduleCursorRestore(TUCTouchInputManager *manager, CGPoint point) {
+    NSUInteger generation = manager.rackCursorRestoreGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (manager.rackCursorRestoreGeneration != generation ||
+            manager.rackSyntheticDragActive || manager.rackSyntheticPinchActive) return;
+        CGWarpMouseCursorPosition(point);
+        if (manager.rackCursorHideRequested) {
+            CGDisplayShowCursor(CGMainDisplayID());
+            manager.rackCursorHideRequested = NO;
+        }
+    });
+}
+
+static void RackLogAccessibilityOnce(void) {
+    static dispatch_once_t accessibilityLogOnce;
+    dispatch_once(&accessibilityLogOnce, ^{
+        NSLog(@"Touch Up Accessibility access: %@", AXIsProcessTrusted() ? @"granted" : @"denied");
+    });
+}
+
+static void RackPostMagnifyEvent(CGPoint point,
+                                 CGFloat magnification,
+                                 NSTouchPhase phase,
+                                 pid_t targetPID) {
+    (void)targetPID;
+    // Touch Up's upstream magnify implementation uses Quartz gesture event 29.
+    // Construct it at the rack midpoint directly instead of first posting a
+    // mouse-move, so the visible system cursor can remain on JetKVM.
+    CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                               point, kCGMouseButtonLeft);
+    if (!event) return;
+    CGEventSetType(event, 29);
+    CGEventSetFlags(event, 0);
+    CGEventSetDoubleValueField(event, 113, magnification);
+    CGEventSetDoubleValueField(event, 114, magnification);
+    CGEventSetDoubleValueField(event, 116, magnification);
+    CGEventSetDoubleValueField(event, 118, magnification);
+    CGEventSetIntegerValueField(event, 50, 248);
+    CGEventSetIntegerValueField(event, 101, 4);
+    CGEventSetIntegerValueField(event, 110, 8);
+    CGEventSetIntegerValueField(event, 132, phase);
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
+static CGFloat RackPinchDistance(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2) {
+    CGFloat dx = x1 - x2;
+    CGFloat dy = y1 - y2;
+    return sqrt(dx * dx + dy * dy);
+}
+
+static CGPoint RackPinchMidpoint(TUCTouchInputManager *manager,
+                                 uint32_t locationID,
+                                 CGFloat x1, CGFloat y1,
+                                 CGFloat x2, CGFloat y2) {
+    CGPoint p1 = RackTargetPoint(manager, locationID, x1, y1);
+    CGPoint p2 = RackTargetPoint(manager, locationID, x2, y2);
+    return CGPointMake((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
+}
+
+void TouchInputManagerPerformRackTap(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticDrag];
+    CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
+    TUCCursorUtilities *cursor = [TUCCursorUtilities sharedInstance];
+    CGPoint restorePoint = RackSafeRestorePoint(manager, locationID);
+    RackLogAccessibilityOnce();
+
+    // A move-to-touch followed by a delayed click makes Safari's auto-hidden
+    // toolbar and the macOS menu bar reveal before the dashboard receives the
+    // click. Post the down/up pair atomically, with the pointer hidden, then
+    // restore the remote-console cursor without generating another click.
+    CGDisplayHideCursor(CGMainDisplayID());
+    [cursor performClickAt:targetPoint];
+    CGWarpMouseCursorPosition(restorePoint);
+    CGDisplayShowCursor(CGMainDisplayID());
+}
+
+void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticDrag];
+    RackLogAccessibilityOnce();
+
+    CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
+    manager.rackSyntheticDragRestorePoint = RackSafeRestorePoint(manager, locationID);
+    manager.rackSyntheticDragLastPoint = targetPoint;
+    manager.rackSyntheticDragTargetPID = RackWindowPIDAtPoint(targetPoint);
+    manager.rackSyntheticDragEventNumber = RackNextMouseEventNumber();
+    CGRect constraintRect = CGRectZero;
+    manager.rackSyntheticDragConstrained = RackSliderBoundsAtPoint(targetPoint,
+                                                                    &constraintRect);
+    manager.rackSyntheticDragConstraintRect = constraintRect;
+    manager.rackCursorRestoreGeneration += 1;
+    manager.rackSyntheticDragActive = YES;
+
+    RackEnsureCursorHidden(manager);
+    RackPostMouseEvent(kCGEventLeftMouseDown, targetPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+}
+
+void TouchInputManagerUpdateRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (!manager.rackSyntheticDragActive) return;
+
+    CGPoint targetPoint = RackConstrainDragPoint(
+        manager, RackTargetPoint(manager, locationID, x, y));
+    manager.rackSyntheticDragLastPoint = targetPoint;
+    RackPostMouseEvent(kCGEventLeftMouseDragged, targetPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+}
+
+void TouchInputManagerEndRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (!manager.rackSyntheticDragActive) return;
+
+    CGPoint targetPoint = RackConstrainDragPoint(
+        manager, RackTargetPoint(manager, locationID, x, y));
+    RackPostMouseEvent(kCGEventLeftMouseDragged, targetPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+    RackPostMouseEvent(kCGEventLeftMouseUp, targetPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+    manager.rackSyntheticDragActive = NO;
+    manager.rackSyntheticDragConstrained = NO;
+    RackScheduleCursorRestore(manager, manager.rackSyntheticDragRestorePoint);
+}
+
+void TouchInputManagerCancelRackDrag(void *self) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticDrag];
+}
+
+- (void)cancelRackSyntheticDrag {
+    if (!self.rackSyntheticDragActive) return;
+
+    RackPostMouseEvent(kCGEventLeftMouseUp, self.rackSyntheticDragLastPoint,
+                       self.rackSyntheticDragEventNumber,
+                       self.rackSyntheticDragTargetPID);
+    self.rackSyntheticDragActive = NO;
+    self.rackSyntheticDragConstrained = NO;
+    RackScheduleCursorRestore(self, self.rackSyntheticDragRestorePoint);
+}
+
+void TouchInputManagerBeginRackPinch(void *self, uint32_t locationID,
+                                    CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticDrag];
+    [manager cancelRackSyntheticPinch];
+    RackLogAccessibilityOnce();
+
+    manager.rackSyntheticPinchRestorePoint = RackSafeRestorePoint(manager, locationID);
+    manager.rackSyntheticPinchLastPoint = RackPinchMidpoint(manager, locationID,
+                                                           x1, y1, x2, y2);
+    manager.rackSyntheticPinchLastDistance = RackPinchDistance(x1, y1, x2, y2);
+    manager.rackSyntheticPinchTargetPID = RackWindowPIDAtPoint(manager.rackSyntheticPinchLastPoint);
+    manager.rackCursorRestoreGeneration += 1;
+    manager.rackSyntheticPinchActive = YES;
+    RackEnsureCursorHidden(manager);
+    RackPostMagnifyEvent(manager.rackSyntheticPinchLastPoint, 0.0,
+                         NSTouchPhaseBegan, manager.rackSyntheticPinchTargetPID);
+}
+
+void TouchInputManagerUpdateRackPinch(void *self, uint32_t locationID,
+                                     CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (!manager.rackSyntheticPinchActive) return;
+
+    CGFloat distance = RackPinchDistance(x1, y1, x2, y2);
+    CGFloat delta = distance - manager.rackSyntheticPinchLastDistance;
+    manager.rackSyntheticPinchLastDistance = distance;
+    manager.rackSyntheticPinchLastPoint = RackPinchMidpoint(manager, locationID,
+                                                            x1, y1, x2, y2);
+    if (fabs(delta) > 0.00001) {
+        RackPostMagnifyEvent(manager.rackSyntheticPinchLastPoint,
+                             delta * 4.0, NSTouchPhaseMoved,
+                             manager.rackSyntheticPinchTargetPID);
+    }
+}
+
+void TouchInputManagerEndRackPinch(void *self) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (!manager.rackSyntheticPinchActive) return;
+
+    RackPostMagnifyEvent(manager.rackSyntheticPinchLastPoint, 0.0,
+                         NSTouchPhaseEnded, manager.rackSyntheticPinchTargetPID);
+    manager.rackSyntheticPinchActive = NO;
+    RackScheduleCursorRestore(manager, manager.rackSyntheticPinchRestorePoint);
+}
+
+void TouchInputManagerCancelRackPinch(void *self) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticPinch];
+}
+
+- (void)cancelRackSyntheticPinch {
+    if (!self.rackSyntheticPinchActive) return;
+
+    RackPostMagnifyEvent(self.rackSyntheticPinchLastPoint, 0.0,
+                         NSTouchPhaseEnded, self.rackSyntheticPinchTargetPID);
+    self.rackSyntheticPinchActive = NO;
+    RackScheduleCursorRestore(self, self.rackSyntheticPinchRestorePoint);
 }
 
 
