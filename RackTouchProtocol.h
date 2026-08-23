@@ -11,10 +11,10 @@
 #define kRackTouchMaximumReportLength 64u
 
 /* Empirical four-corner calibration for the GeekPi/DeskPi 1280x400 panel. */
-#define kRackTouchRawMinX 166.0
-#define kRackTouchRawMaxX 16249.0
-#define kRackTouchRawMinY 180.0
-#define kRackTouchRawMaxY 9264.0
+#define kRackTouchRawMinX -92.064
+#define kRackTouchRawMaxX 16435.664
+#define kRackTouchRawMinY -77.908
+#define kRackTouchRawMaxY 9905.108
 #define kRackTouchLogicalWidth 1280.0
 #define kRackTouchLogicalHeight 400.0
 

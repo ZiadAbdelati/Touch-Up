@@ -21,8 +21,8 @@ void CloseHIDManager(void);
 /// Applies to currently-connected and future devices. Pen interfaces stay shared.
 void SetTouchDevicesSeized(bool seize);
 
-/// Runtime USB topology identifier reported by the privileged RackTouchSeizer.
-/// Zero means that the helper has not delivered a packet yet.
+/// Runtime USB topology identifier of the directly matched rack touchscreen.
+/// Zero means that no matching interface has been discovered yet.
 uint32_t RackTouchCurrentLocationID(void);
 
 #endif /* HIDInterpreter_h */

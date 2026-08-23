@@ -17,10 +17,6 @@ static IOHIDManagerRef gManager;
 static int gServerSocket = -1;
 static int gClientSocket = -1;
 static pthread_mutex_t gClientLock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t gButtons = 0;
-static uint16_t gAbsoluteX = 0;
-static uint16_t gAbsoluteY = 0;
-static Boolean gValueFlushScheduled = false;
 static Boolean gLoggedFirstValueReport = false;
 static unsigned gRawReportLogCount = 0;
 static unsigned gDigitizerValueLogCount = 0;
@@ -175,33 +171,44 @@ static void ForwardInputReport(void *context, IOReturn result, void *sender,
                 result);
         gRawReportLogCount++;
     }
+    // The mouse interface's descriptor is report 0x07 followed by buttons,
+    // absolute X/Y, and wheel. Forward one compact packet per physical HID
+    // report instead of rebuilding reports from separately delivered element
+    // values. That preserves every up/down edge when a tap is followed quickly
+    // by another contact; run-loop coalescing used to lose the intermediate up.
+    if (reportID == 0x07) {
+        CFIndex payloadOffset = reportLength == 7 && report[0] == 0x07 ? 1 : 0;
+        if (reportLength - payloadOffset >= 5) {
+            uint8_t compactReport[5] = {
+                report[payloadOffset],
+                report[payloadOffset + 1],
+                report[payloadOffset + 2],
+                report[payloadOffset + 3],
+                report[payloadOffset + 4],
+            };
+            if (!gLoggedFirstValueReport) {
+                uint16_t x = (uint16_t)compactReport[1] |
+                             ((uint16_t)compactReport[2] << 8);
+                uint16_t y = (uint16_t)compactReport[3] |
+                             ((uint16_t)compactReport[4] << 8);
+                fprintf(stderr,
+                        "Rack touchscreen physical reports active: x=%u y=%u buttons=0x%02x.\n",
+                        x, y, compactReport[0]);
+                gLoggedFirstValueReport = true;
+            }
+            ForwardReport(compactReport, sizeof(compactReport), 0, timestamp);
+            return;
+        }
+    }
+
     // The WCH digitizer advertises a 54-byte report (ID 0x0d) containing all
-    // ten contact collections. Keep the report ID and timestamp intact in the
-    // existing packet; the user process can decode the complete frame and
-    // preserve contact/frame boundaries. Other matched reports retain the
-    // existing mouse forwarding path.
+    // ten contact collections. Keep the report ID and timestamp intact so the
+    // user process can decode complete contact/frame boundaries.
     if (reportID == 0x0d && reportLength == 54) {
         ForwardReport(report, reportLength, reportID, timestamp);
         return;
     }
     ForwardReport(report, reportLength, reportID, timestamp);
-}
-
-static void FlushCurrentValueReport(void) {
-    gValueFlushScheduled = false;
-    uint8_t report[5] = {
-        gButtons,
-        (uint8_t)(gAbsoluteX & 0xff),
-        (uint8_t)(gAbsoluteX >> 8),
-        (uint8_t)(gAbsoluteY & 0xff),
-        (uint8_t)(gAbsoluteY >> 8),
-    };
-    if (!gLoggedFirstValueReport) {
-        fprintf(stderr, "Rack touchscreen HID values active: x=%u y=%u buttons=0x%02x.\n",
-                gAbsoluteX, gAbsoluteY, gButtons);
-        gLoggedFirstValueReport = true;
-    }
-    ForwardReport(report, sizeof(report), 0, mach_absolute_time());
 }
 
 static void ForwardInputValue(void *context, IOReturn result, void *sender,
@@ -226,31 +233,9 @@ static void ForwardInputValue(void *context, IOReturn result, void *sender,
         }
         return;
     }
-    if (!IsRackMouseInterface(device)) return;
-    uint32_t page = IOHIDElementGetUsagePage(element);
-    uint32_t usage = IOHIDElementGetUsage(element);
-    CFIndex integerValue = IOHIDValueGetIntegerValue(value);
-    Boolean relevant = false;
-
-    if (page == kHIDPage_Button && usage == 1) {
-        if (integerValue) gButtons |= 0x01;
-        else gButtons &= (uint8_t)~0x01;
-        relevant = true;
-    } else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_X) {
-        gAbsoluteX = (uint16_t)integerValue;
-        relevant = true;
-    } else if (page == kHIDPage_GenericDesktop && usage == kHIDUsage_GD_Y) {
-        gAbsoluteY = (uint16_t)integerValue;
-        relevant = true;
-    }
-
-    if (relevant && !gValueFlushScheduled) {
-        gValueFlushScheduled = true;
-        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
-            FlushCurrentValueReport();
-        });
-        CFRunLoopWakeUp(CFRunLoopGetMain());
-    }
+    // Mouse reports are forwarded atomically by ForwardInputReport. Element
+    // callbacks are intentionally ignored here so they cannot duplicate or
+    // coalesce button transitions.
 }
 
 static void StopRunLoop(int signalNumber) {
@@ -371,23 +356,12 @@ int main(void) {
     AddNumber(mouseMatch, CFSTR(kIOHIDDeviceUsagePageKey), kHIDPage_GenericDesktop);
     AddNumber(mouseMatch, CFSTR(kIOHIDDeviceUsageKey), kHIDUsage_GD_Mouse);
 
-    CFMutableDictionaryRef digitizerMatch = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks);
-    AddNumber(digitizerMatch, CFSTR(kIOHIDVendorIDKey), kRackTouchVendorID);
-    AddNumber(digitizerMatch, CFSTR(kIOHIDProductIDKey), kRackTouchProductID);
-    AddNumber(digitizerMatch, CFSTR(kIOHIDDeviceUsagePageKey), kHIDPage_Digitizer);
-    AddNumber(digitizerMatch, CFSTR(kIOHIDDeviceUsageKey), kHIDUsage_Dig_TouchScreen);
-
     gManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
-    const void *matchesValues[] = { mouseMatch, digitizerMatch };
-    CFArrayRef matches = CFArrayCreate(kCFAllocatorDefault, matchesValues, 2,
-                                       &kCFTypeArrayCallBacks);
-    IOHIDManagerSetDeviceMatchingMultiple(gManager, matches);
-    CFRelease(matches);
+    // The daemon owns only the mouse-compatible sibling. Touch Up opens the
+    // digitizer directly, so including both interfaces here creates an
+    // all-or-nothing exclusive-open race after either process restarts.
+    IOHIDManagerSetDeviceMatching(gManager, mouseMatch);
     CFRelease(mouseMatch);
-    CFRelease(digitizerMatch);
 
     IOHIDManagerRegisterDeviceMatchingCallback(gManager, DeviceMatched, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(gManager, DeviceRemoved, NULL);

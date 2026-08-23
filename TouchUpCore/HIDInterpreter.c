@@ -81,6 +81,7 @@ static void* gTouchManager;
 static CFRunLoopRef gRunLoopRef;
 
 static IOHIDManagerRef gHidManager;
+static Boolean gHidManagerSeized = false;
 
 // When true, accepted touch interfaces are opened exclusively (seized) so macOS and other
 // apps no longer receive their events — Touch Up becomes the sole handler. Opt-in.
@@ -585,6 +586,16 @@ static uint32_t DeviceUInt32Property(IOHIDDeviceRef device, CFStringRef key) {
     return result;
 }
 
+static void SetMatchingUInt32(CFMutableDictionaryRef dictionary,
+                              CFStringRef key,
+                              uint32_t value) {
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault,
+                                        kCFNumberSInt32Type, &value);
+    if (!number) return;
+    CFDictionarySetValue(dictionary, key, number);
+    CFRelease(number);
+}
+
 static Boolean IsRackTouchController(IOHIDDeviceRef device) {
     return DeviceUInt32Property(device, CFSTR(kIOHIDVendorIDKey)) == kRackTouchVendorID &&
            DeviceUInt32Property(device, CFSTR(kIOHIDProductIDKey)) == kRackTouchProductID;
@@ -638,8 +649,8 @@ static void ScheduleRackMouseReleaseWatchdog(void) {
 static void ProcessRackMouseInputReport(uint32_t locationID,
                                         const uint8_t *report,
                                         CFIndex reportLength) {
-    // The helper also observes a seven-byte vendor report. Only its synthesized
-    // five-byte HID-value packet has an unambiguous buttons/X/Y layout.
+    // Both direct capture and the optional helper bridge deliver an atomic
+    // five-byte buttons/X/Y packet, preserving contact transitions in order.
     if (!gTouchManager || locationID == 0 || reportLength != 5) return;
     uint8_t buttons = report[0];
     uint16_t rawX = (uint16_t)report[1] |
@@ -845,7 +856,32 @@ static void Handle_RackMouseInputReport(void *context,
     (void)type;
     IOHIDDeviceRef device = (IOHIDDeviceRef)(context ? context : sender);
     HIDPassiveSiblingState *state = PassiveSiblingForRef(device);
-    if (state) ProcessRackInputReport(state->locationID, reportID, report, reportLength);
+    if (!state) return;
+
+    // Mouse report 0x07 is report-ID, buttons, absolute X/Y and wheel. Convert
+    // the complete physical report directly so contact edges remain ordered.
+    CFIndex payloadOffset = reportLength == 7 && report[0] == 0x07 ? 1 : 0;
+    if (reportID == 0x07 && reportLength - payloadOffset >= 5) {
+        uint32_t locationID = state->locationID;
+        uint8_t buttons = report[payloadOffset];
+        uint8_t xLow = report[payloadOffset + 1];
+        uint8_t xHigh = report[payloadOffset + 2];
+        uint8_t yLow = report[payloadOffset + 3];
+        uint8_t yHigh = report[payloadOffset + 4];
+
+        // Return from the physical HID callback before posting synthetic mouse
+        // events. The old helper bridge naturally provided this boundary; doing
+        // it synchronously can make WindowServer discard down/up and drag events
+        // while the seized source report is still being delivered.
+        CFRunLoopPerformBlock(gRunLoopRef, kCFRunLoopCommonModes, ^{
+            uint8_t compactReport[5] = { buttons, xLow, xHigh, yLow, yHigh };
+            ProcessRackMouseInputReport(locationID,
+                                        compactReport, sizeof(compactReport));
+        });
+        CFRunLoopWakeUp(gRunLoopRef);
+        return;
+    }
+    ProcessRackInputReport(state->locationID, reportID, report, reportLength);
 }
 
 static void SetRackBridgeSocket(int socketFD) {
@@ -967,6 +1003,12 @@ static void StopRackBridge(void) {
 }
 
 static void ApplyPassiveSiblingSeizeState(HIDPassiveSiblingState *state) {
+    if (gHidManagerSeized) {
+        // The narrowly matched manager already owns this interface. A second
+        // IOHIDDeviceOpen call would only add a shared client, not strengthen
+        // the manager's exclusive open.
+        return;
+    }
     if (gSeizeTouchDevices && !state->seized) {
         IOReturn result = IOHIDDeviceOpen(state->device, kIOHIDOptionsTypeSeizeDevice);
         if (result == kIOReturnSuccess) {
@@ -1036,6 +1078,10 @@ static void ApplySeizeState(HIDDeviceState *state) {
             IOHIDDeviceClose(state->device, kIOHIDOptionsTypeSeizeDevice);
             state->seized = false;
         }
+        return;
+    }
+
+    if (gHidManagerSeized) {
         return;
     }
 
@@ -1212,6 +1258,13 @@ static void Handle_DeviceMatchingCallback(
 
     printf("Touchscreen connected with locationID: 0x%08x\n", locationID);
 
+    // Direct capture no longer depends on the privileged bridge to announce
+    // the rack controller's USB location. Record it before notifying the
+    // Objective-C mapper so the very first connection maps to RTK FHD.
+    if (locationID != 0 && IsRackTouchController(inIOHIDDeviceRef)) {
+        __atomic_store_n(&gRackTouchLocationID, locationID, __ATOMIC_RELAXED);
+    }
+
     // This exact WCH controller's mouse-compatible sibling is the source of the
     // native cursor-relative click. Capture it, but never feed it into Touch Up's
     // coordinate parser. Matching vendor/product/usage keeps every other mouse,
@@ -1352,16 +1405,24 @@ void OpenHIDManager(void *delegate) {
     //    CFMutableDictionaryRef keypad =
     //    CreateDeviceMatchingDictionary(kHIDPage_Digitizer, kHIDUsage_Dig_Touch);
     
-    CFMutableDictionaryRef matchesList[] = {
-        CreateDeviceMatchingDictionary(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen),
-    };
+    CFMutableDictionaryRef rackDigitizer =
+        CreateDeviceMatchingDictionary(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen);
+    CFMutableDictionaryRef rackMouse =
+        CreateDeviceMatchingDictionary(kHIDPage_GenericDesktop, kHIDUsage_GD_Mouse);
+    SetMatchingUInt32(rackDigitizer, CFSTR(kIOHIDVendorIDKey), kRackTouchVendorID);
+    SetMatchingUInt32(rackDigitizer, CFSTR(kIOHIDProductIDKey), kRackTouchProductID);
+    SetMatchingUInt32(rackMouse, CFSTR(kIOHIDVendorIDKey), kRackTouchVendorID);
+    SetMatchingUInt32(rackMouse, CFSTR(kIOHIDProductIDKey), kRackTouchProductID);
+    const void *matchesList[] = { rackDigitizer, rackMouse };
     
     
     
     CFArrayRef matches = CFArrayCreate(kCFAllocatorDefault,
-                                       (const void **)matchesList, 1, NULL);
+                                       matchesList, 2, &kCFTypeArrayCallBacks);
     IOHIDManagerSetDeviceMatchingMultiple(gHidManager, matches);
     CFRelease(matches);
+    CFRelease(rackDigitizer);
+    CFRelease(rackMouse);
     
     IOHIDManagerRegisterDeviceMatchingCallback(gHidManager, Handle_DeviceMatchingCallback, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(gHidManager, Handle_RemovalCallback, NULL);
@@ -1375,7 +1436,16 @@ void OpenHIDManager(void *delegate) {
     IOHIDManagerScheduleWithRunLoop(gHidManager, gRunLoopRef,
                                     kCFRunLoopCommonModes);
     
-    IOHIDManagerOpen(gHidManager, kIOHIDOptionsTypeNone);
+    // The matching dictionaries contain both hardware IDs and interface usage,
+    // so exclusive manager open cannot capture JetKVM or an unrelated mouse.
+    gHidManagerSeized = true;
+    IOReturn openResult = IOHIDManagerOpen(gHidManager, kIOHIDOptionsTypeSeizeDevice);
+    if (openResult != kIOReturnSuccess) {
+        gHidManagerSeized = false;
+        fprintf(stderr,
+                "Unable to seize rack touchscreen HID manager (IOReturn 0x%08x).\n",
+                openResult);
+    }
 }
 
 
@@ -1391,5 +1461,8 @@ void CloseHIDManager(void) {
     }
 
     IOHIDManagerUnscheduleFromRunLoop(gHidManager, gRunLoopRef, kCFRunLoopCommonModes);
-    IOHIDManagerClose(gHidManager, kIOHIDOptionsTypeNone);
+    IOHIDManagerClose(gHidManager, gHidManagerSeized
+                                   ? kIOHIDOptionsTypeSeizeDevice
+                                   : kIOHIDOptionsTypeNone);
+    gHidManagerSeized = false;
 }

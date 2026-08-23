@@ -12,6 +12,10 @@
 #import "../RackTouchProtocol.h"
 #import <dlfcn.h>
 
+static const CGFloat kRackTopEdgeStartZone = 48.0;
+static const CGFloat kRackTopEdgeRevealDistance = 24.0;
+static const CGFloat kRackTopEdgeApproachInset = 12.0;
+
 @interface TUCTouchInputManager ()
 
 @property NSMutableDictionary<NSNumber *, NSNumber *> *frameIDsByLocationID;
@@ -35,6 +39,13 @@
 @property BOOL rackSyntheticDragConstrained;
 @property CGRect rackSyntheticDragConstraintRect;
 
+@property BOOL rackSyntheticScrollActive;
+@property CGPoint rackSyntheticScrollRestorePoint;
+@property CGPoint rackSyntheticScrollLastPoint;
+@property CGPoint rackSyntheticScrollStartPoint;
+@property BOOL rackTopEdgeRevealCandidate;
+@property BOOL rackChromeRevealActive;
+
 @property BOOL rackSyntheticPinchActive;
 @property CGPoint rackSyntheticPinchRestorePoint;
 @property CGPoint rackSyntheticPinchLastPoint;
@@ -42,6 +53,7 @@
 @property pid_t rackSyntheticPinchTargetPID;
 
 @property BOOL rackCursorHideRequested;
+@property NSUInteger rackCursorHideBalance;
 @property NSUInteger rackCursorRestoreGeneration;
 
 @end
@@ -950,6 +962,32 @@ static CGPoint RackConstrainDragPoint(TUCTouchInputManager *manager, CGPoint poi
     return point;
 }
 
+static void RackPostScrollEvent(CGPoint point, CGPoint translation) {
+    if (fabs(translation.x) < 0.01 && fabs(translation.y) < 0.01) return;
+    CGEventRef event = CGEventCreateScrollWheelEvent2(NULL,
+                                                      kCGScrollEventUnitPixel,
+                                                      2,
+                                                      translation.y,
+                                                      translation.x,
+                                                      0);
+    if (!event) return;
+    // Scroll events otherwise inherit the JetKVM cursor position and Safari
+    // sends them to the wrong window. Preserve the visible cursor while routing
+    // this event to the rack window under the finger.
+    CGEventSetLocation(event, point);
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
+static void RackPostMouseMove(CGPoint point) {
+    CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
+                                               point, kCGMouseButtonLeft);
+    if (!event) return;
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
 static void RackPostMouseEvent(CGEventType type,
                                CGPoint point,
                                int64_t eventNumber,
@@ -969,50 +1007,117 @@ static void RackPostMouseEvent(CGEventType type,
     CFRelease(event);
 }
 
-static void RackEnsureCursorHidden(TUCTouchInputManager *manager) {
-    if (manager.rackCursorHideRequested) return;
-
-    // Public cursor hiding normally only affects the foreground process. This
-    // WindowServer connection property is the established compatibility path
-    // used by background remote-input utilities. Resolve it dynamically so a
-    // future macOS version can simply fall back to the public API.
-    typedef int32_t (*RackDefaultConnectionFunction)(void);
-    typedef CGError (*RackSetConnectionPropertyFunction)(int32_t, int32_t,
-                                                          CFStringRef, CFTypeRef);
-    static dispatch_once_t backgroundCursorOnce;
-    dispatch_once(&backgroundCursorOnce, ^{
-        RackDefaultConnectionFunction defaultConnection =
-            (RackDefaultConnectionFunction)dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
-        RackSetConnectionPropertyFunction setConnectionProperty =
-            (RackSetConnectionPropertyFunction)dlsym(RTLD_DEFAULT, "CGSSetConnectionProperty");
-        if (defaultConnection && setConnectionProperty) {
-            int32_t connection = defaultConnection();
-            setConnectionProperty(connection, connection,
-                                  CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
-        }
+static BOOL RackCursorIsCurrentlyVisible(void) {
+    typedef boolean_t (*RackCursorIsVisibleFunction)(void);
+    static RackCursorIsVisibleFunction cursorIsVisible;
+    static dispatch_once_t cursorVisibilityOnce;
+    dispatch_once(&cursorVisibilityOnce, ^{
+        cursorIsVisible = (RackCursorIsVisibleFunction)dlsym(RTLD_DEFAULT,
+                                                              "CGCursorIsVisible");
     });
-    CGDisplayHideCursor(CGMainDisplayID());
-    manager.rackCursorHideRequested = YES;
+    return cursorIsVisible ? cursorIsVisible() : NO;
+}
+
+static void RackEnsureCursorHidden(TUCTouchInputManager *manager) {
+    if (!manager.rackCursorHideRequested) {
+        // Public cursor hiding normally only affects the foreground process.
+        // Enable the established background-utility compatibility property,
+        // resolving it dynamically so future macOS versions can fall back.
+        typedef int32_t (*RackDefaultConnectionFunction)(void);
+        typedef CGError (*RackSetConnectionPropertyFunction)(int32_t, int32_t,
+                                                              CFStringRef, CFTypeRef);
+        static dispatch_once_t backgroundCursorOnce;
+        dispatch_once(&backgroundCursorOnce, ^{
+            RackDefaultConnectionFunction defaultConnection =
+                (RackDefaultConnectionFunction)dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
+            RackSetConnectionPropertyFunction setConnectionProperty =
+                (RackSetConnectionPropertyFunction)dlsym(RTLD_DEFAULT, "CGSSetConnectionProperty");
+            if (defaultConnection && setConnectionProperty) {
+                int32_t connection = defaultConnection();
+                setConnectionProperty(connection, connection,
+                                      CFSTR("SetsCursorInBackground"), kCFBooleanTrue);
+            }
+        });
+        CGDisplayHideCursor(CGMainDisplayID());
+        manager.rackCursorHideBalance += 1;
+        manager.rackCursorHideRequested = YES;
+        return;
+    }
+
+    // WindowServer or the receiving app can occasionally re-show the cursor
+    // while processing a synthetic click/drag. Re-hide only when CoreGraphics
+    // confirms it is actually visible, avoiding unbalanced hide counts.
+    if (RackCursorIsCurrentlyVisible()) {
+        CGDisplayHideCursor(CGMainDisplayID());
+        manager.rackCursorHideBalance += 1;
+    }
+}
+
+static void RackScheduleCursorRestoreAfter(TUCTouchInputManager *manager,
+                                           CGPoint point,
+                                           NSTimeInterval delay) {
+    NSUInteger generation = manager.rackCursorRestoreGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (manager.rackCursorRestoreGeneration != generation ||
+            manager.rackSyntheticDragActive || manager.rackSyntheticScrollActive ||
+            manager.rackSyntheticPinchActive || manager.rackChromeRevealActive) return;
+        // A silent warp does not tell Safari that the pointer left the top
+        // edge, so fullscreen chrome can remain latched. Post a genuine move
+        // while the cursor is still hidden, then enforce the final position.
+        RackPostMouseMove(point);
+        CGWarpMouseCursorPosition(point);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(0.03 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (manager.rackCursorRestoreGeneration != generation ||
+                manager.rackSyntheticDragActive || manager.rackSyntheticScrollActive ||
+                manager.rackSyntheticPinchActive || manager.rackChromeRevealActive) return;
+            if (manager.rackCursorHideRequested) {
+                while (manager.rackCursorHideBalance > 0) {
+                    CGDisplayShowCursor(CGMainDisplayID());
+                    manager.rackCursorHideBalance -= 1;
+                }
+                manager.rackCursorHideRequested = NO;
+            }
+        });
+    });
 }
 
 static void RackScheduleCursorRestore(TUCTouchInputManager *manager, CGPoint point) {
-    NSUInteger generation = manager.rackCursorRestoreGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (manager.rackCursorRestoreGeneration != generation ||
-            manager.rackSyntheticDragActive || manager.rackSyntheticPinchActive) return;
-        CGWarpMouseCursorPosition(point);
-        if (manager.rackCursorHideRequested) {
-            CGDisplayShowCursor(CGMainDisplayID());
-            manager.rackCursorHideRequested = NO;
-        }
-    });
+    RackScheduleCursorRestoreAfter(manager, point, 0.05);
+}
+
+static BOOL RackShouldPromoteScrollToHorizontalDrag(TUCTouchInputManager *manager,
+                                                    CGPoint targetPoint) {
+    CGFloat totalX = targetPoint.x - manager.rackSyntheticScrollStartPoint.x;
+    CGFloat totalY = targetPoint.y - manager.rackSyntheticScrollStartPoint.y;
+    return fabs(totalX) >= 12.0 && fabs(totalX) >= fabs(totalY) * 1.5;
+}
+
+static void RackPromoteScrollToHorizontalDrag(TUCTouchInputManager *manager,
+                                              CGPoint targetPoint) {
+    manager.rackSyntheticScrollActive = NO;
+    manager.rackTopEdgeRevealCandidate = NO;
+    manager.rackSyntheticDragActive = YES;
+    manager.rackSyntheticDragLastPoint = targetPoint;
+    RackPostMouseEvent(kCGEventLeftMouseDown,
+                       manager.rackSyntheticScrollStartPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+    RackPostMouseEvent(kCGEventLeftMouseDragged,
+                       targetPoint,
+                       manager.rackSyntheticDragEventNumber,
+                       manager.rackSyntheticDragTargetPID);
+    RackEnsureCursorHidden(manager);
 }
 
 static void RackLogAccessibilityOnce(void) {
     static dispatch_once_t accessibilityLogOnce;
     dispatch_once(&accessibilityLogOnce, ^{
-        NSLog(@"Touch Up Accessibility access: %@", AXIsProcessTrusted() ? @"granted" : @"denied");
+        NSLog(@"Touch Up Accessibility access: %@; event-post access: %@",
+              AXIsProcessTrusted() ? @"granted" : @"denied",
+              CGPreflightPostEventAccess() ? @"granted" : @"denied");
     });
 }
 
@@ -1068,10 +1173,11 @@ void TouchInputManagerPerformRackTap(void *self, uint32_t locationID, CGFloat x,
     // toolbar and the macOS menu bar reveal before the dashboard receives the
     // click. Post the down/up pair atomically, with the pointer hidden, then
     // restore the remote-console cursor without generating another click.
-    CGDisplayHideCursor(CGMainDisplayID());
+    manager.rackCursorRestoreGeneration += 1;
+    RackEnsureCursorHidden(manager);
     [cursor performClickAt:targetPoint];
-    CGWarpMouseCursorPosition(restorePoint);
-    CGDisplayShowCursor(CGMainDisplayID());
+    RackEnsureCursorHidden(manager);
+    RackScheduleCursorRestore(manager, restorePoint);
 }
 
 void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
@@ -1089,9 +1195,28 @@ void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, 
                                                                     &constraintRect);
     manager.rackSyntheticDragConstraintRect = constraintRect;
     manager.rackCursorRestoreGeneration += 1;
-    manager.rackSyntheticDragActive = YES;
 
     RackEnsureCursorHidden(manager);
+    if (!manager.rackSyntheticDragConstrained) {
+        // A finger movement over ordinary page content should behave like a
+        // touchscreen scroll, not a mouse drag that selects text. Actual AX
+        // sliders retain the captured mouse down/drag/up path below.
+        manager.rackSyntheticScrollRestorePoint = manager.rackSyntheticDragRestorePoint;
+        manager.rackSyntheticScrollLastPoint = targetPoint;
+        manager.rackSyntheticScrollStartPoint = targetPoint;
+        TUCScreen *rackScreen = [manager touchscreenForLocationID:locationID];
+        CGFloat localStartY = targetPoint.y - CGRectGetMinY(rackScreen.frame);
+        // A 24-point strip was narrower than a fingertip on this 75 mm-tall
+        // panel, so valid edge pulls were often classified as ordinary scrolls.
+        // Keep the strip small enough not to steal dashboard scrolling while
+        // allowing a deliberate contact just below Safari's visible chrome.
+        manager.rackTopEdgeRevealCandidate =
+            localStartY >= 0.0 && localStartY <= kRackTopEdgeStartZone;
+        manager.rackSyntheticScrollActive = YES;
+        return;
+    }
+
+    manager.rackSyntheticDragActive = YES;
     RackPostMouseEvent(kCGEventLeftMouseDown, targetPoint,
                        manager.rackSyntheticDragEventNumber,
                        manager.rackSyntheticDragTargetPID);
@@ -1099,6 +1224,69 @@ void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, 
 
 void TouchInputManagerUpdateRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
     TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (manager.rackSyntheticScrollActive) {
+        CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
+        if (manager.rackTopEdgeRevealCandidate) {
+            CGFloat totalX = targetPoint.x - manager.rackSyntheticScrollStartPoint.x;
+            CGFloat totalY = targetPoint.y - manager.rackSyntheticScrollStartPoint.y;
+            if (totalY >= kRackTopEdgeRevealDistance && fabs(totalX) <= totalY * 2.0) {
+                TUCScreen *rackScreen = [manager touchscreenForLocationID:locationID];
+                CGFloat edgeY = CGRectGetMinY(rackScreen.frame);
+                CGPoint approachPoint = CGPointMake(targetPoint.x,
+                                                    edgeY + kRackTopEdgeApproachInset);
+                CGPoint edgePoint = CGPointMake(targetPoint.x, edgeY);
+                manager.rackTopEdgeRevealCandidate = NO;
+                manager.rackSyntheticScrollActive = NO;
+                manager.rackChromeRevealActive = YES;
+
+                // Safari's auto-hidden toolbar does not reliably react to a
+                // single teleport from another display to the exact edge. Give
+                // WindowServer a real inside-to-edge trajectory on consecutive
+                // run-loop turns. The generation check prevents a delayed edge
+                // move from racing a newer tap or gesture.
+                NSUInteger revealGeneration = manager.rackCursorRestoreGeneration;
+                RackPostMouseMove(approachPoint);
+                RackEnsureCursorHidden(manager);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(0.04 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (manager.rackCursorRestoreGeneration != revealGeneration) return;
+                    RackPostMouseMove(edgePoint);
+                    RackEnsureCursorHidden(manager);
+                });
+                return;
+            }
+            // Reserve a deliberate downward pull, but fall back to ordinary
+            // scrolling as soon as the trajectory is upward or strongly
+            // horizontal. Include the deferred movement in that first event.
+            if (totalY >= 0.0 && totalY < kRackTopEdgeRevealDistance &&
+                fabs(totalX) <= kRackTopEdgeStartZone) return;
+            manager.rackTopEdgeRevealCandidate = NO;
+            if (RackShouldPromoteScrollToHorizontalDrag(manager, targetPoint)) {
+                RackPromoteScrollToHorizontalDrag(manager, targetPoint);
+                return;
+            }
+            CGPoint deferred = CGPointMake(totalX, totalY);
+            manager.rackSyntheticScrollLastPoint = targetPoint;
+            RackPostScrollEvent(targetPoint, deferred);
+            RackEnsureCursorHidden(manager);
+            return;
+        }
+        if (RackShouldPromoteScrollToHorizontalDrag(manager, targetPoint)) {
+            RackPromoteScrollToHorizontalDrag(manager, targetPoint);
+            return;
+        }
+        CGPoint translation = CGPointMake(targetPoint.x - manager.rackSyntheticScrollLastPoint.x,
+                                          targetPoint.y - manager.rackSyntheticScrollLastPoint.y);
+        manager.rackSyntheticScrollLastPoint = targetPoint;
+        RackPostScrollEvent(targetPoint, translation);
+        RackEnsureCursorHidden(manager);
+        return;
+    }
+    if (manager.rackChromeRevealActive) {
+        RackEnsureCursorHidden(manager);
+        return;
+    }
     if (!manager.rackSyntheticDragActive) return;
 
     CGPoint targetPoint = RackConstrainDragPoint(
@@ -1107,10 +1295,28 @@ void TouchInputManagerUpdateRackDrag(void *self, uint32_t locationID, CGFloat x,
     RackPostMouseEvent(kCGEventLeftMouseDragged, targetPoint,
                        manager.rackSyntheticDragEventNumber,
                        manager.rackSyntheticDragTargetPID);
+    RackEnsureCursorHidden(manager);
 }
 
 void TouchInputManagerEndRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
     TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    if (manager.rackChromeRevealActive) {
+        manager.rackChromeRevealActive = NO;
+        // Leave the pointer at the edge long enough for Safari/macOS chrome to
+        // animate in and accept a follow-up touch, but always return to JetKVM.
+        RackScheduleCursorRestoreAfter(manager, manager.rackSyntheticScrollRestorePoint, 2.0);
+        return;
+    }
+    if (manager.rackSyntheticScrollActive) {
+        CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
+        CGPoint translation = CGPointMake(targetPoint.x - manager.rackSyntheticScrollLastPoint.x,
+                                          targetPoint.y - manager.rackSyntheticScrollLastPoint.y);
+        RackPostScrollEvent(targetPoint, translation);
+        manager.rackSyntheticScrollActive = NO;
+        manager.rackTopEdgeRevealCandidate = NO;
+        RackScheduleCursorRestore(manager, manager.rackSyntheticScrollRestorePoint);
+        return;
+    }
     if (!manager.rackSyntheticDragActive) return;
 
     CGPoint targetPoint = RackConstrainDragPoint(
@@ -1121,6 +1327,7 @@ void TouchInputManagerEndRackDrag(void *self, uint32_t locationID, CGFloat x, CG
     RackPostMouseEvent(kCGEventLeftMouseUp, targetPoint,
                        manager.rackSyntheticDragEventNumber,
                        manager.rackSyntheticDragTargetPID);
+    RackEnsureCursorHidden(manager);
     manager.rackSyntheticDragActive = NO;
     manager.rackSyntheticDragConstrained = NO;
     RackScheduleCursorRestore(manager, manager.rackSyntheticDragRestorePoint);
@@ -1132,6 +1339,17 @@ void TouchInputManagerCancelRackDrag(void *self) {
 }
 
 - (void)cancelRackSyntheticDrag {
+    if (self.rackChromeRevealActive) {
+        self.rackChromeRevealActive = NO;
+        RackScheduleCursorRestore(self, self.rackSyntheticScrollRestorePoint);
+        return;
+    }
+    if (self.rackSyntheticScrollActive) {
+        self.rackSyntheticScrollActive = NO;
+        self.rackTopEdgeRevealCandidate = NO;
+        RackScheduleCursorRestore(self, self.rackSyntheticScrollRestorePoint);
+        return;
+    }
     if (!self.rackSyntheticDragActive) return;
 
     RackPostMouseEvent(kCGEventLeftMouseUp, self.rackSyntheticDragLastPoint,
