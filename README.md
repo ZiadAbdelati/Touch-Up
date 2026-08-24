@@ -13,6 +13,8 @@ matched, directly seized HID path and rack-specific event handling.
 
 - A tap activates the corresponding point on `RTK FHD`, independent of the
   cursor position on JetKVM.
+- A stationary 650 ms tap-and-hold performs one right-click and consumes the
+  physical release so it does not immediately dismiss the context menu.
 - One-finger drag works for Home Assistant sliders.
 - One-finger movement over ordinary page content produces pixel scrolling;
   Accessibility sliders and deliberate horizontal slider movement receive

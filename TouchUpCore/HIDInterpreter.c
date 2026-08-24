@@ -89,6 +89,7 @@ static Boolean gSeizeTouchDevices = false;
 static Boolean gRackMouseLeftButtonDown = false;
 static Boolean gRackMouseLoggedFirstReport = false;
 static Boolean gRackMouseDragging = false;
+static Boolean gRackMouseLongPressFired = false;
 static Boolean gRackPinching = false;
 static Boolean gRackSuppressMouseUntilAllContactsUp = false;
 static Boolean gRackDigitizerLoggedFirstReport = false;
@@ -98,6 +99,7 @@ static uint16_t gRackMouseLastY = 0;
 static CGFloat gRackMouseStartX = 0.0;
 static CGFloat gRackMouseStartY = 0.0;
 static uint64_t gRackMouseWatchdogGeneration = 0;
+static uint64_t gRackMouseHoldGeneration = 0;
 static pthread_t gRackBridgeThread;
 static Boolean gRackBridgeStarted = false;
 static volatile sig_atomic_t gRackBridgeStop = 0;
@@ -628,8 +630,12 @@ static CGFloat NormalizeRackCoordinate(uint16_t raw, CGFloat minimum, CGFloat ma
 
 static void ScheduleRackMouseReleaseWatchdog(void) {
     uint64_t generation = ++gRackMouseWatchdogGeneration;
+    // A stationary contact has not posted a synthetic mouse-down, so it can
+    // safely wait long enough for the hold recognizer. Once dragging begins,
+    // retain the shorter guard against a globally latched left button.
+    double timeout = gRackMouseDragging ? 0.30 : 0.90;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(0.30 * NSEC_PER_SEC)),
+                                 (int64_t)(timeout * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (generation != gRackMouseWatchdogGeneration ||
             !gRackMouseLeftButtonDown) return;
@@ -642,7 +648,29 @@ static void ScheduleRackMouseReleaseWatchdog(void) {
         }
         gRackMouseLeftButtonDown = false;
         gRackMouseDragging = false;
+        gRackMouseLongPressFired = false;
+        gRackMouseHoldGeneration++;
         fprintf(stderr, "Rack touch release watchdog cancelled a stale contact.\n");
+    });
+}
+
+static void ScheduleRackMouseLongPress(uint32_t locationID,
+                                       CGFloat x, CGFloat y) {
+    uint64_t generation = ++gRackMouseHoldGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(0.65 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != gRackMouseHoldGeneration ||
+            !gRackMouseLeftButtonDown ||
+            gRackMouseDragging ||
+            gRackMouseLongPressFired ||
+            gRackSuppressMouseUntilAllContactsUp ||
+            !gTouchManager) return;
+
+        gRackMouseLongPressFired = true;
+        fprintf(stderr, "Rack long press emitted secondary click normalized=(%.4f, %.4f)\n",
+                x, y);
+        TouchInputManagerPerformRackSecondaryTap(gTouchManager, locationID, x, y);
     });
 }
 
@@ -665,7 +693,11 @@ static void ProcessRackMouseInputReport(uint32_t locationID,
     // stream until the digitizer confirms that every finger has lifted. This
     // prevents its first-contact mouse-up from becoming a stray dashboard tap.
     if (gRackSuppressMouseUntilAllContactsUp) {
-        if (!down) gRackMouseLeftButtonDown = false;
+        if (!down) {
+            gRackMouseLeftButtonDown = false;
+            gRackMouseLongPressFired = false;
+            gRackMouseHoldGeneration++;
+        }
         return;
     }
 
@@ -693,7 +725,15 @@ static void ProcessRackMouseInputReport(uint32_t locationID,
         gRackMouseStartX = x;
         gRackMouseStartY = y;
         gRackMouseDragging = false;
+        gRackMouseLongPressFired = false;
+        ScheduleRackMouseLongPress(locationID, x, y);
     } else if (down) {
+        // A long press has already produced its complete right-down/right-up
+        // pair. Ignore any remaining contact jitter until the physical release.
+        if (gRackMouseLongPressFired) {
+            gRackMouseLeftButtonDown = true;
+            return;
+        }
         // Eight screen points filters normal finger jitter without making a
         // Home Assistant slider feel reluctant. This rack display is fixed at
         // 1280x400 logical points; rotation is applied later by the manager.
@@ -701,17 +741,22 @@ static void ProcessRackMouseInputReport(uint32_t locationID,
         CGFloat dy = (y - gRackMouseStartY) * kRackTouchLogicalHeight;
         static const CGFloat kRackDragThresholdSquared = 8.0 * 8.0;
         if (!gRackMouseDragging && dx * dx + dy * dy >= kRackDragThresholdSquared) {
+            gRackMouseHoldGeneration++;
             fprintf(stderr, "Rack drag began normalized=(%.4f, %.4f)\n",
                     gRackMouseStartX, gRackMouseStartY);
             TouchInputManagerBeginRackDrag(gTouchManager, locationID,
                                            gRackMouseStartX, gRackMouseStartY);
             gRackMouseDragging = true;
+            ScheduleRackMouseReleaseWatchdog();
         }
         if (gRackMouseDragging) {
             TouchInputManagerUpdateRackDrag(gTouchManager, locationID, x, y);
         }
     } else if (gRackMouseLeftButtonDown) {
-        if (gRackMouseDragging) {
+        gRackMouseHoldGeneration++;
+        if (gRackMouseLongPressFired) {
+            fprintf(stderr, "Rack long press release consumed.\n");
+        } else if (gRackMouseDragging) {
             fprintf(stderr, "Rack drag ended normalized=(%.4f, %.4f)\n", x, y);
             TouchInputManagerEndRackDrag(gTouchManager, locationID, x, y);
         } else {
@@ -720,6 +765,7 @@ static void ProcessRackMouseInputReport(uint32_t locationID,
             TouchInputManagerPerformRackTap(gTouchManager, locationID, x, y);
         }
         gRackMouseDragging = false;
+        gRackMouseLongPressFired = false;
     }
     gRackMouseLeftButtonDown = down;
 }
@@ -796,6 +842,8 @@ static Boolean ProcessRackDigitizerInputReport(uint32_t locationID,
     if (activeCount >= 2) {
         gRackSuppressMouseUntilAllContactsUp = true;
         if (!gRackPinching) {
+            gRackMouseHoldGeneration++;
+            gRackMouseLongPressFired = false;
             if (gRackMouseDragging) {
                 TouchInputManagerCancelRackDrag(gTouchManager);
             }
@@ -911,6 +959,8 @@ static ssize_t ReceiveRackPacket(int socketFD, RackTouchPacket *packet) {
 // mouse button held or the cursor hidden, and the next connection must begin
 // from an idle contact state rather than consuming a stale release.
 static void ResetRackMouseGestureState(void) {
+    gRackMouseWatchdogGeneration++;
+    gRackMouseHoldGeneration++;
     if (gRackMouseDragging && gTouchManager) {
         TouchInputManagerCancelRackDrag(gTouchManager);
     }
@@ -918,6 +968,7 @@ static void ResetRackMouseGestureState(void) {
         TouchInputManagerCancelRackPinch(gTouchManager);
     }
     gRackMouseDragging = false;
+    gRackMouseLongPressFired = false;
     gRackPinching = false;
     gRackSuppressMouseUntilAllContactsUp = false;
     gRackMouseLeftButtonDown = false;
@@ -1314,6 +1365,7 @@ static void Handle_RemovalCallback(
 
     if (UnregisterPassiveSibling(inIOHIDDeviceRef)) {
         printf("Rack touchscreen mouse sibling disconnected.\n");
+        ResetRackMouseGestureState();
         return;
     }
     
@@ -1325,6 +1377,10 @@ static void Handle_RemovalCallback(
 
     uint32_t locationID = device->locationID;
     printf("Touchscreen disconnected with locationID: 0x%08x\n", locationID);
+
+    if (IsRackTouchController(inIOHIDDeviceRef)) {
+        ResetRackMouseGestureState();
+    }
 
     DeallocateDeviceState(inIOHIDDeviceRef);
 

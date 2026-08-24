@@ -29,22 +29,24 @@ install or run `RackTouchSeizer`; if an earlier setup installed it, run
 1. Park the mouse cursor on the JetKVM display.
 2. Tap controls near all four edges of the rack dashboard; the touched controls
    should activate without revealing Safari's toolbar or the macOS menu bar.
-3. Drag a Home Assistant slider. The cursor should remain hidden and return to
+3. Hold a context-clickable target without moving for about 650 ms. Exactly one
+   context menu should appear, and lifting the finger must not dismiss it.
+4. Drag a Home Assistant slider. The cursor should remain hidden and return to
    JetKVM after release.
-4. Swipe vertically over ordinary dashboard content. The page should track the
+5. Swipe vertically over ordinary dashboard content. The page should track the
    finger without selecting text or moving the visible JetKVM cursor.
-5. Begin in the top 48 points and pull downward by at least 24 points. Safari
+6. Begin in the top 48 points and pull downward by at least 24 points. Safari
    and macOS navigation chrome should reveal; the cursor returns to JetKVM
    automatically after two seconds, and Safari should dismiss the chrome after
    observing that real pointer movement away from its top edge.
-6. Drag beyond the edge of a slider popup and release. The value should change,
+7. Drag beyond the edge of a slider popup and release. The value should change,
    but the release should not dismiss the popup.
-7. After changing the panel or display scaling, repeat the edge/center tap test.
+8. After changing the panel or display scaling, repeat the edge/center tap test.
    The optional helper-assisted calibration workflow below is only needed if
    those targets are no longer accurate.
-8. Unplug/replug the touch USB connection and repeat tap/drag/scroll.
-9. Quit and reopen the app and repeat.
-10. Reboot and verify the app Login Item, mapping, and cursor restoration.
+9. Unplug/replug the touch USB connection and repeat tap/hold/drag/scroll.
+10. Quit and reopen the app and repeat.
+11. Reboot and verify the app Login Item, mapping, and cursor restoration.
 
 Pinch is not an acceptance criterion because this controller did not emit
 multitouch frames during testing.

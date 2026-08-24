@@ -36,15 +36,25 @@ events being discarded inside the seized source callback. TouchUpCore records
 the runtime IOKit location ID and calibrates the measured raw ranges to
 normalized panel coordinates.
 
-A stationary down/up is emitted as an atomic click. Movement beyond eight
-logical screen points becomes a captured drag. During drag, Touch Up hides the
-cursor, posts a balanced down/drag/up sequence, and restores the saved cursor
+A stationary down/up is emitted as an atomic click. Holding within the eight
+point movement tolerance for 650 ms emits one atomic right-click; the eventual
+physical release is consumed. Movement beyond eight logical screen points
+cancels the hold timer and becomes a captured drag. During drag, Touch Up hides
+the cursor, posts a balanced down/drag/up sequence, and restores the saved cursor
 position after the receiving app processes mouse-up. If Accessibility identifies
 the target as a slider, coordinates are clamped inside its bounds.
 
-The 300 ms watchdog releases a synthetic drag if the controller stops sending
-before button-up. Device removal and app shutdown perform the same gesture-state
-reset.
+For Home Assistant custom sliders that Safari does not expose as `AXSlider`, a
+deliberate horizontal gesture is promoted from scrolling to mouse dragging. The
+last dragged event carries the requested value, while the balancing mouse-up is
+delivered at the original control point. This keeps the down/up target inside
+the modal and prevents its backdrop from treating an out-of-bounds release as a
+click-away.
+
+A 900 ms pre-drag watchdog allows a stationary hold to resolve without leaving
+stale contact state. As soon as dragging begins, the timeout tightens to 300 ms
+so an interrupted report stream cannot leave a synthetic mouse button latched.
+Device removal and app shutdown perform the same gesture-state reset.
 
 ## Screen mapping
 

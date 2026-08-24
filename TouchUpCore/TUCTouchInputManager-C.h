@@ -25,6 +25,12 @@ void TouchInputManagerDidDisconnectTouchscreen(void *self, uint32_t locationID);
 // restoring it to its previous (typically JetKVM) position immediately after.
 void TouchInputManagerPerformRackTap(void *self, uint32_t locationID, CGFloat x, CGFloat y);
 
+// Atomically right-clicks a rack-screen point for a stationary long press.
+// The physical button-up is consumed by the HID recognizer, so it cannot turn
+// into a follow-up primary click that dismisses the resulting context menu.
+void TouchInputManagerPerformRackSecondaryTap(void *self, uint32_t locationID,
+                                               CGFloat x, CGFloat y);
+
 // Synthesizes a rack-screen drag while keeping the cursor hidden. The cursor is
 // restored to its previous (typically JetKVM) position when the drag ends.
 void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y);

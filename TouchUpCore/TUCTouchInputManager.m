@@ -33,10 +33,12 @@ static const CGFloat kRackTopEdgeApproachInset = 12.0;
 
 @property BOOL rackSyntheticDragActive;
 @property CGPoint rackSyntheticDragRestorePoint;
+@property CGPoint rackSyntheticDragStartPoint;
 @property CGPoint rackSyntheticDragLastPoint;
 @property pid_t rackSyntheticDragTargetPID;
 @property int64_t rackSyntheticDragEventNumber;
 @property BOOL rackSyntheticDragConstrained;
+@property BOOL rackSyntheticDragReleaseAtStart;
 @property CGRect rackSyntheticDragConstraintRect;
 
 @property BOOL rackSyntheticScrollActive;
@@ -1100,6 +1102,12 @@ static void RackPromoteScrollToHorizontalDrag(TUCTouchInputManager *manager,
     manager.rackSyntheticScrollActive = NO;
     manager.rackTopEdgeRevealCandidate = NO;
     manager.rackSyntheticDragActive = YES;
+    // Home Assistant's custom web-component sliders are not always exposed as
+    // AXSlider. Their backdrop can interpret a mouse-up outside the modal as a
+    // click-away even after a valid drag. Preserve the final value with the
+    // last dragged event, then release at the original slider point so the
+    // down/up targets share the control rather than its modal backdrop.
+    manager.rackSyntheticDragReleaseAtStart = YES;
     manager.rackSyntheticDragLastPoint = targetPoint;
     RackPostMouseEvent(kCGEventLeftMouseDown,
                        manager.rackSyntheticScrollStartPoint,
@@ -1180,6 +1188,22 @@ void TouchInputManagerPerformRackTap(void *self, uint32_t locationID, CGFloat x,
     RackScheduleCursorRestore(manager, restorePoint);
 }
 
+void TouchInputManagerPerformRackSecondaryTap(void *self, uint32_t locationID,
+                                               CGFloat x, CGFloat y) {
+    TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
+    [manager cancelRackSyntheticDrag];
+    CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
+    TUCCursorUtilities *cursor = [TUCCursorUtilities sharedInstance];
+    CGPoint restorePoint = RackSafeRestorePoint(manager, locationID);
+    RackLogAccessibilityOnce();
+
+    manager.rackCursorRestoreGeneration += 1;
+    RackEnsureCursorHidden(manager);
+    [cursor performSecondaryClickAt:targetPoint];
+    RackEnsureCursorHidden(manager);
+    RackScheduleCursorRestore(manager, restorePoint);
+}
+
 void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, CGFloat y) {
     TUCTouchInputManager *manager = (__bridge TUCTouchInputManager *)self;
     [manager cancelRackSyntheticDrag];
@@ -1187,12 +1211,14 @@ void TouchInputManagerBeginRackDrag(void *self, uint32_t locationID, CGFloat x, 
 
     CGPoint targetPoint = RackTargetPoint(manager, locationID, x, y);
     manager.rackSyntheticDragRestorePoint = RackSafeRestorePoint(manager, locationID);
+    manager.rackSyntheticDragStartPoint = targetPoint;
     manager.rackSyntheticDragLastPoint = targetPoint;
     manager.rackSyntheticDragTargetPID = RackWindowPIDAtPoint(targetPoint);
     manager.rackSyntheticDragEventNumber = RackNextMouseEventNumber();
     CGRect constraintRect = CGRectZero;
     manager.rackSyntheticDragConstrained = RackSliderBoundsAtPoint(targetPoint,
                                                                     &constraintRect);
+    manager.rackSyntheticDragReleaseAtStart = NO;
     manager.rackSyntheticDragConstraintRect = constraintRect;
     manager.rackCursorRestoreGeneration += 1;
 
@@ -1324,12 +1350,15 @@ void TouchInputManagerEndRackDrag(void *self, uint32_t locationID, CGFloat x, CG
     RackPostMouseEvent(kCGEventLeftMouseDragged, targetPoint,
                        manager.rackSyntheticDragEventNumber,
                        manager.rackSyntheticDragTargetPID);
-    RackPostMouseEvent(kCGEventLeftMouseUp, targetPoint,
+    CGPoint releasePoint = manager.rackSyntheticDragReleaseAtStart
+        ? manager.rackSyntheticDragStartPoint : targetPoint;
+    RackPostMouseEvent(kCGEventLeftMouseUp, releasePoint,
                        manager.rackSyntheticDragEventNumber,
                        manager.rackSyntheticDragTargetPID);
     RackEnsureCursorHidden(manager);
     manager.rackSyntheticDragActive = NO;
     manager.rackSyntheticDragConstrained = NO;
+    manager.rackSyntheticDragReleaseAtStart = NO;
     RackScheduleCursorRestore(manager, manager.rackSyntheticDragRestorePoint);
 }
 
@@ -1352,11 +1381,14 @@ void TouchInputManagerCancelRackDrag(void *self) {
     }
     if (!self.rackSyntheticDragActive) return;
 
-    RackPostMouseEvent(kCGEventLeftMouseUp, self.rackSyntheticDragLastPoint,
+    CGPoint releasePoint = self.rackSyntheticDragReleaseAtStart
+        ? self.rackSyntheticDragStartPoint : self.rackSyntheticDragLastPoint;
+    RackPostMouseEvent(kCGEventLeftMouseUp, releasePoint,
                        self.rackSyntheticDragEventNumber,
                        self.rackSyntheticDragTargetPID);
     self.rackSyntheticDragActive = NO;
     self.rackSyntheticDragConstrained = NO;
+    self.rackSyntheticDragReleaseAtStart = NO;
     RackScheduleCursorRestore(self, self.rackSyntheticDragRestorePoint);
 }
 

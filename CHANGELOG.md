@@ -2,6 +2,11 @@
 
 ## Rack interaction update — 2026-08-23
 
+- Added a stationary 650 ms tap-and-hold gesture that emits one right-click,
+  suppresses the release tap, and cancels as soon as a drag begins.
+- Released non-Accessibility Home Assistant slider drags at their original
+  control point, preventing an out-of-modal finger release from becoming a
+  backdrop click-away while retaining the final dragged value.
 - Added one-finger pixel scrolling over normal web content while preserving
   mouse-style dragging for Accessibility-detected sliders.
 - Routed scroll events to the rack window without moving the JetKVM cursor.
