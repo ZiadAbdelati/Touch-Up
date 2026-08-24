@@ -6,8 +6,9 @@ GeekPi/DeskPi 2U touchscreen behave as an absolute second-display touchscreen
 on macOS while a JetKVM remains usable as the primary pointer display.
 
 The fork is source-only and currently tested on an Intel NUC Hackintosh
-(`x86_64`). It preserves the upstream app and framework, then adds a narrowly
-matched, directly seized HID path and rack-specific event handling.
+(`x86_64`). It preserves the upstream app and framework, then adds a signed,
+narrowly matched HID helper, a private local report bridge, and rack-specific
+event handling.
 
 ## What works
 
@@ -26,7 +27,7 @@ matched, directly seized HID path and rack-specific event handling.
   release outside a popup does not become a click-away.
 - A watchdog cancels incomplete HID contacts, preventing a stuck drag or
   trapped cursor after an interrupted report stream.
-- Direct HID capture reconnects after app or USB restarts.
+- The helper and report bridge reconnect after app or USB restarts.
 - The optional MQTT/DDC companion preserves
   `number.rack_screen_brightness` in Home Assistant.
 
@@ -48,20 +49,24 @@ does not make this panel multitouch.
 
 These defaults live together in `RackTouchProtocol.h`. A multi-point calibration
 tool is included under `tools/`; because a separate calibration executable does
-not share Touch Up's Input Monitoring identity, that tool uses the optional
-legacy helper socket and is not part of normal runtime. The USB location ID is
-discovered at runtime, so moving the touchscreen to another USB port no longer
-requires recompiling.
+not have HID privacy access, it consumes the installed helper socket. The USB
+location ID is discovered at runtime, so moving the touchscreen to another USB
+port no longer requires recompiling.
 
 ## Components
 
-- `Touch Up/` and `TouchUpCore/`: upstream app/framework plus direct, exclusive
-  capture of the matching WCH mouse/digitizer interfaces and rack event mapping.
-- `RackTouchSeizer/`: retained source for the earlier privileged-helper fallback.
-  It is not installed or required by the current direct-capture configuration.
+- `Touch Up/` and `TouchUpCore/`: upstream app/framework plus direct capture of
+  the WCH digitizer, private helper-socket input, and rack event mapping.
+- `RackTouchSeizer/`: signed LaunchDaemon that exclusively owns only the WCH
+  mouse-compatible interface and forwards atomic physical reports locally.
 - `RackTouchProtocol.h`: shared packet format and hardware defaults.
 - `extras/rack-screen-mqtt/`: independently installable MQTT/DDC brightness
   bridge; no broker credentials are stored in this repository.
+- `extras/touch-up-launcher/`: delayed per-user launcher that avoids the
+  post-reboot display/USB/privacy initialization race, waits for helper
+  readiness, and preserves the signed app's TCC responsibility.
+- `extras/rack-screen-suite/`: combined install, uninstall, and status commands
+  for the helper, launcher, and optional MQTT/DDC service.
 - `docs/`: architecture, setup, recovery, and implementation notes.
 
 ## Build and install
@@ -72,14 +77,27 @@ requires recompiling.
 2. Put the signed app in `/Applications`, launch it, and grant both
    **Accessibility** and **Input Monitoring** in System Settings → Privacy &
    Security.
-3. In Touch Up settings, confirm the detected touchscreen is mapped to
+3. Install the combined runtime package. It signs the helper with the same
+   locally available leaf identity as the app, installs the system helper
+   first, and installs the helper-gated user launcher second:
+
+```sh
+./extras/rack-screen-suite/install.sh
+```
+
+4. Add `/Library/PrivilegedHelperTools/com.rofkek.rack-touch-seizer` to
+   **Input Monitoring** on first install. A stable helper signature allows this
+   grant to persist through normal reboots and same-identity rebuilds.
+5. In Touch Up settings, confirm the detected touchscreen is mapped to
    `RTK FHD`. Quit and reopen the app after changing privacy grants.
-4. Test tap, drag, and vertical scrolling with the normal mouse cursor parked
+6. Test tap, drag, and vertical scrolling with the normal mouse cursor parked
    on JetKVM.
 
-The app should be added as a Login Item if it is not already started by another
-per-user launcher. Do not run the legacy `RackTouchSeizer` LaunchDaemon at the
-same time: both implementations attempt to seize the same HID interface.
+Check the complete runtime without exposing credentials:
+
+```sh
+./extras/rack-screen-suite/status.sh
+```
 
 ## MQTT/DDC brightness
 
@@ -91,19 +109,21 @@ an existing mode-600 configuration.
 
 ## Recovery and uninstall
 
-First quit and reopen Touch Up and verify that its Accessibility and Input
-Monitoring grants still refer to the installed, signed application. If the
-legacy helper was previously installed and is still seizing the interface,
-remove it cleanly:
+First run the suite status command and verify that the signed helper readiness
+socket exists before Touch Up starts. Then verify that both privacy grants still
+refer to the installed signed app and that Input Monitoring contains the signed
+helper. Remove the touch runtime while leaving the app and privacy entries in
+place with:
 
 ```sh
-./RackTouchSeizer/uninstall.sh
+./extras/rack-screen-suite/uninstall.sh
 ```
 
-Useful direct-capture diagnostics:
+Useful diagnostics:
 
 ```sh
 log stream --style compact --predicate 'process == "Touch Up"'
+tail -F /Library/Logs/com.rofkek.rack-touch-seizer.log
 ioreg -r -c IOHIDDevice -l | grep -E 'VendorID|ProductID|PrimaryUsage|LocationID'
 ```
 

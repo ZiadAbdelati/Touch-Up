@@ -52,10 +52,44 @@ done
 for shell_script in "$repo_root"/extras/rack-screen-mqtt/*.sh; do
   bash -n "$shell_script"
 done
+for shell_script in "$repo_root"/extras/touch-up-launcher/*.sh; do
+  zsh -n "$shell_script"
+done
+for shell_script in "$repo_root"/extras/rack-screen-suite/*.sh; do
+  zsh -n "$shell_script"
+done
 
 plutil -lint \
   "$repo_root/RackTouchSeizer/com.rofkek.rack-touch-seizer.plist" \
-  "$repo_root/extras/rack-screen-mqtt/com.rofkek.rack-screen-mqtt.plist.template"
+  "$repo_root/extras/rack-screen-mqtt/com.rofkek.rack-screen-mqtt.plist.template" \
+  "$repo_root/extras/touch-up-launcher/com.rofkek.touch-up.plist.template"
+
+if grep -q 'CreateDeviceMatchingDictionary(kHIDPage_GenericDesktop' \
+    "$repo_root/TouchUpCore/HIDInterpreter.c"; then
+  echo 'Touch Up must not match the mouse sibling in helper-first mode.' >&2
+  exit 1
+fi
+grep -q '/var/run/com.rofkek.rack-touch-seizer.sock' \
+  "$repo_root/extras/touch-up-launcher/start.sh"
+grep -q 'stat -f %u' "$repo_root/extras/touch-up-launcher/start.sh"
+grep -q 'stat -f %Sp' "$repo_root/extras/touch-up-launcher/start.sh"
+
+python3 - "$repo_root/RackTouchSeizer/RackTouchSeizer.c" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+exclusive_open = source.index(
+    "IOHIDManagerOpen(gManager, kIOHIDOptionsTypeSeizeDevice)"
+)
+ready_socket = source.index("if (StartReportServer() != 0)", exclusive_open)
+if ready_socket < exclusive_open:
+    raise SystemExit("helper readiness socket is created before exclusive HID open")
+if "consoleInfo->st_uid < 501" not in source:
+    raise SystemExit("helper can publish its socket for an early-boot service account")
+if "account->pw_name[0] == '_'" not in source:
+    raise SystemExit("helper does not reject underscore-prefixed service accounts")
+PY
 
 if python3 -c 'import pytest' >/dev/null 2>&1; then
   (cd "$repo_root/extras/rack-screen-mqtt" && python3 -m pytest tests -q)

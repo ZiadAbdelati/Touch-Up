@@ -79,10 +79,9 @@ static const CGFloat kRackTopEdgeApproachInset = 12.0;
     }
     CGDisplayShowCursor(kCGNullDirectDisplay);
 
-    // This machine's touchscreen exposes a mouse-compatible HID path in
-    // addition to its digitizer path. Seize the accepted digitizer interface
-    // before opening the manager so macOS cannot emit a second click at the
-    // pre-existing cursor position on another display.
+    // The privileged helper owns the mouse-compatible HID path. Touch Up
+    // exclusively opens only the accepted digitizer interface; physical mouse
+    // reports arrive later through the helper's private socket.
     SetTouchDevicesSeized(true);
 
     __weak id weakSelf = self;

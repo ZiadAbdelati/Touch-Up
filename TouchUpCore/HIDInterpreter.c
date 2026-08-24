@@ -677,8 +677,8 @@ static void ScheduleRackMouseLongPress(uint32_t locationID,
 static void ProcessRackMouseInputReport(uint32_t locationID,
                                         const uint8_t *report,
                                         CFIndex reportLength) {
-    // Both direct capture and the optional helper bridge deliver an atomic
-    // five-byte buttons/X/Y packet, preserving contact transitions in order.
+    // The helper bridge delivers an atomic five-byte buttons/X/Y packet,
+    // preserving contact transitions in order.
     if (!gTouchManager || locationID == 0 || reportLength != 5) return;
     uint8_t buttons = report[0];
     uint16_t rawX = (uint16_t)report[1] |
@@ -1093,6 +1093,14 @@ static void RegisterPassiveSibling(IOHIDDeviceRef device, uint32_t locationID) {
                                            sizeof(state->reportBuffer),
                                            Handle_RackMouseInputReport,
                                            (void *)state->device);
+    // Device-level input-report callbacks must be scheduled explicitly. The
+    // manager's schedule is sufficient for its match/removal callbacks, but
+    // relying on it to drive this sibling's report callback is racy after an
+    // app restart or USB reconnect: the interface can match successfully and
+    // then never deliver another packet.
+    IOHIDDeviceScheduleWithRunLoop(state->device,
+                                   gRunLoopRef,
+                                   kCFRunLoopCommonModes);
     ApplyPassiveSiblingSeizeState(state);
 }
 
@@ -1104,6 +1112,9 @@ static Boolean UnregisterPassiveSibling(IOHIDDeviceRef device) {
         if (state->seized) {
             IOHIDDeviceClose(state->device, kIOHIDOptionsTypeSeizeDevice);
         }
+        IOHIDDeviceUnscheduleFromRunLoop(state->device,
+                                         gRunLoopRef,
+                                         kCFRunLoopCommonModes);
         CFRelease(state->device);
 
         gPassiveSiblingCount--;
@@ -1309,20 +1320,20 @@ static void Handle_DeviceMatchingCallback(
 
     printf("Touchscreen connected with locationID: 0x%08x\n", locationID);
 
-    // Direct capture no longer depends on the privileged bridge to announce
-    // the rack controller's USB location. Record it before notifying the
-    // Objective-C mapper so the very first connection maps to RTK FHD.
+    // Record the digitizer's USB location before notifying the Objective-C
+    // mapper so the very first helper packet maps to RTK FHD.
     if (locationID != 0 && IsRackTouchController(inIOHIDDeviceRef)) {
         __atomic_store_n(&gRackTouchLocationID, locationID, __ATOMIC_RELAXED);
     }
 
     // This exact WCH controller's mouse-compatible sibling is the source of the
-    // native cursor-relative click. Capture it, but never feed it into Touch Up's
-    // coordinate parser. Matching vendor/product/usage keeps every other mouse,
-    // including JetKVM, completely outside this path.
+    // native cursor-relative click. The signed helper already owns it and sends
+    // atomic reports over the private socket. A composite HID device can still
+    // surface this sibling through the digitizer match on some macOS versions,
+    // so explicitly ignore it here rather than opening a second client.
     if (IsRackTouchMouseInterface(inIOHIDDeviceRef)) {
-        printf("Rack touchscreen mouse sibling connected at 0x%08x\n", locationID);
-        RegisterPassiveSibling(inIOHIDDeviceRef, locationID);
+        printf("Ignoring helper-owned rack touchscreen mouse sibling at 0x%08x\n",
+               locationID);
         return;
     }
 
@@ -1463,22 +1474,17 @@ void OpenHIDManager(void *delegate) {
     
     CFMutableDictionaryRef rackDigitizer =
         CreateDeviceMatchingDictionary(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen);
-    CFMutableDictionaryRef rackMouse =
-        CreateDeviceMatchingDictionary(kHIDPage_GenericDesktop, kHIDUsage_GD_Mouse);
     SetMatchingUInt32(rackDigitizer, CFSTR(kIOHIDVendorIDKey), kRackTouchVendorID);
     SetMatchingUInt32(rackDigitizer, CFSTR(kIOHIDProductIDKey), kRackTouchProductID);
-    SetMatchingUInt32(rackMouse, CFSTR(kIOHIDVendorIDKey), kRackTouchVendorID);
-    SetMatchingUInt32(rackMouse, CFSTR(kIOHIDProductIDKey), kRackTouchProductID);
-    const void *matchesList[] = { rackDigitizer, rackMouse };
+    const void *matchesList[] = { rackDigitizer };
     
     
     
     CFArrayRef matches = CFArrayCreate(kCFAllocatorDefault,
-                                       matchesList, 2, &kCFTypeArrayCallBacks);
+                                       matchesList, 1, &kCFTypeArrayCallBacks);
     IOHIDManagerSetDeviceMatchingMultiple(gHidManager, matches);
     CFRelease(matches);
     CFRelease(rackDigitizer);
-    CFRelease(rackMouse);
     
     IOHIDManagerRegisterDeviceMatchingCallback(gHidManager, Handle_DeviceMatchingCallback, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(gHidManager, Handle_RemovalCallback, NULL);
@@ -1492,14 +1498,14 @@ void OpenHIDManager(void *delegate) {
     IOHIDManagerScheduleWithRunLoop(gHidManager, gRunLoopRef,
                                     kCFRunLoopCommonModes);
     
-    // The matching dictionaries contain both hardware IDs and interface usage,
-    // so exclusive manager open cannot capture JetKVM or an unrelated mouse.
-    gHidManagerSeized = true;
-    IOReturn openResult = IOHIDManagerOpen(gHidManager, kIOHIDOptionsTypeSeizeDevice);
+    // Open the manager only for discovery. The accepted digitizer is opened
+    // exclusively after its queue has been registered and scheduled. The
+    // helper owns the mouse sibling before this user process starts.
+    gHidManagerSeized = false;
+    IOReturn openResult = IOHIDManagerOpen(gHidManager, kIOHIDOptionsTypeNone);
     if (openResult != kIOReturnSuccess) {
-        gHidManagerSeized = false;
         fprintf(stderr,
-                "Unable to seize rack touchscreen HID manager (IOReturn 0x%08x).\n",
+                "Unable to open rack touchscreen HID manager (IOReturn 0x%08x).\n",
                 openResult);
     }
 }

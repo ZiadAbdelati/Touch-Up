@@ -24,13 +24,38 @@ static uid_t gConsoleUID = (uid_t)-1;
 static gid_t gConsoleGID = (gid_t)-1;
 static uint32_t gRackLocationID = 0;
 
+static Boolean IsInteractiveConsoleAccount(const struct stat *consoleInfo,
+                                           struct passwd **accountOut) {
+    // During early boot /dev/console can be owned by service accounts such as
+    // _windowserver. Publishing the private socket for that account makes it
+    // unusable by the subsequently logged-in Touch Up process. Local macOS
+    // login accounts start at UID 501 and do not use underscore-prefixed names.
+    if (!consoleInfo || consoleInfo->st_uid < 501) return false;
+
+    struct passwd *account = getpwuid(consoleInfo->st_uid);
+    if (!account || !account->pw_name || account->pw_name[0] == '_') return false;
+    if (!account->pw_shell ||
+        strcmp(account->pw_shell, "/usr/bin/false") == 0 ||
+        strcmp(account->pw_shell, "/sbin/nologin") == 0) {
+        return false;
+    }
+
+    if (accountOut) *accountOut = account;
+    return true;
+}
+
 static void WaitForConsoleUser(void) {
     struct stat consoleInfo;
+    fprintf(stderr, "Rack touch helper waiting for an interactive console user.\n");
     for (;;) {
-        if (stat("/dev/console", &consoleInfo) == 0 && consoleInfo.st_uid != 0) {
-            struct passwd *account = getpwuid(consoleInfo.st_uid);
+        struct passwd *account = NULL;
+        if (stat("/dev/console", &consoleInfo) == 0 &&
+            IsInteractiveConsoleAccount(&consoleInfo, &account)) {
             gConsoleUID = consoleInfo.st_uid;
-            gConsoleGID = account ? account->pw_gid : consoleInfo.st_gid;
+            gConsoleGID = account->pw_gid;
+            fprintf(stderr,
+                    "Rack touch helper console user ready: %s (uid %u).\n",
+                    account->pw_name, gConsoleUID);
             return;
         }
         sleep(1);
@@ -342,11 +367,6 @@ int main(void) {
     signal(SIGTERM, StopRunLoop);
     signal(SIGINT, StopRunLoop);
 
-    if (StartReportServer() != 0) {
-        fprintf(stderr, "Unable to create Touch Up report bridge socket.\n");
-        return 1;
-    }
-
     CFMutableDictionaryRef mouseMatch = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0,
         &kCFTypeDictionaryKeyCallBacks,
@@ -373,6 +393,18 @@ int main(void) {
     if (result != kIOReturnSuccess) {
         fprintf(stderr, "Unable to open rack touchscreen mouse exclusively (0x%08x).\n", result);
         IOHIDManagerUnscheduleFromRunLoop(gManager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+        CFRelease(gManager);
+        return 1;
+    }
+
+    // Publish readiness only after the privacy-authorized exclusive open has
+    // succeeded. The user LaunchAgent treats this socket as the ordering gate,
+    // so creating it earlier could let Touch Up race the helper and seize the
+    // same mouse interface first.
+    if (StartReportServer() != 0) {
+        fprintf(stderr, "Unable to create Touch Up report bridge socket.\n");
+        IOHIDManagerUnscheduleFromRunLoop(gManager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+        IOHIDManagerClose(gManager, kIOHIDOptionsTypeSeizeDevice);
         CFRelease(gManager);
         return 1;
     }

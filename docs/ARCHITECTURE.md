@@ -5,26 +5,39 @@
 ```text
 WCH 27c0:0859 touchscreen
         │ mouse + digitizer HID interfaces
-        ▼
-TouchUpCore IOHIDManager (logged-in user, exclusive open)
-        │ deferred, atomic five-byte absolute report
-        │ calibrated absolute point
-        ▼
-RTK FHD ── tap/drag Quartz events
-        │
-        └── cursor hidden during interaction, then restored to JetKVM
+        ├── mouse ─────► signed RackTouchSeizer LaunchDaemon
+        │                  │ exclusive open + mode-0600 Unix socket
+        │                  ▼
+        │              atomic five-byte absolute report
+        │                  │
+        └── digitizer ─────┴──► signed Touch Up app
+                                   │ calibrated absolute point
+                                   ▼
+                              RTK FHD events
+                                   │
+                                   └── hidden cursor restored to JetKVM
 ```
 
 macOS otherwise consumes the controller's mouse-compatible interface. That
 native event clicks wherever the global mouse cursor currently sits, even when
-Touch Up separately maps the digitizer to the rack display. Touch Up therefore
-matches the exact WCH vendor, product, usage page, and usage and opens that
-narrow IOHID manager with `kIOHIDOptionsTypeSeizeDevice`. This suppresses the
-duplicate native path without affecting JetKVM or an ordinary mouse.
+Touch Up separately maps the digitizer to the rack display. The root helper
+therefore matches the exact WCH vendor, product, usage page, and usage and opens
+only that mouse interface with `kIOHIDOptionsTypeSeizeDevice`. This suppresses
+the duplicate native path without affecting JetKVM or an ordinary mouse.
 
-Direct capture requires Input Monitoring. Quartz event injection and the
-Accessibility slider lookup require Accessibility. The app uses a stable code
-signature so macOS can persist both privacy grants across rebuilds and restarts.
+The helper requires its own Input Monitoring grant; root does not bypass this
+privacy control. Touch Up requires Input Monitoring for its digitizer and
+Accessibility for Quartz event injection and slider lookup. Both binaries use
+stable code signatures so macOS can persist their grants across normal reboots
+and same-identity rebuilds.
+
+The helper creates `/var/run/com.rofkek.rack-touch-seizer.sock` only after its
+exclusive HID open succeeds, then waits for a real interactive console user
+(ignoring early-boot service owners such as `_windowserver`) and restricts the
+socket to that account. The per-user LaunchAgent waits for this socket, verifies
+that it belongs to its own UID, and then opens the exact signed Touch Up bundle
+through LaunchServices. This readiness handshake orders the system and GUI
+launchd domains.
 
 ## Single-contact path
 
@@ -33,8 +46,8 @@ mouse-compatible interface. The HID callback converts every physical report
 into a five-byte button/X/Y report and defers processing to the next run-loop
 turn. Deferring preserves physical contact-edge order while avoiding synthetic
 events being discarded inside the seized source callback. TouchUpCore records
-the runtime IOKit location ID and calibrates the measured raw ranges to
-normalized panel coordinates.
+the runtime IOKit location ID from the digitizer and helper packets, then
+calibrates the measured raw ranges to normalized panel coordinates.
 
 A stationary down/up is emitted as an atomic click. Holding within the eight
 point movement tolerance for 650 ms emits one atomic right-click; the eventual
@@ -58,8 +71,8 @@ Device removal and app shutdown perform the same gesture-state reset.
 
 ## Screen mapping
 
-Rack reports are recognized by the runtime location ID recorded when the direct
-HID interface is matched, not a fixed USB-port address. `RTK FHD` bypasses
+Rack reports are recognized by the runtime location ID recorded when the
+digitizer is matched, not a fixed USB-port address. `RTK FHD` bypasses
 upstream aspect-fit correction because its EDID advertises conventional modes
 that do not describe the physical 1280×400 glass. Rotation is still honored.
 Cursor restoration prefers `JetKVM v1`.
@@ -75,16 +88,17 @@ on this controller and are not claimed as working functionality.
 
 ## Security boundaries
 
-- The app matches only vendor `0x27c0`, product `0x0859`, mouse and touchscreen
-  usages before requesting exclusive access.
-- The app needs Accessibility for Quartz event injection and Input Monitoring
-  for HID access.
+- Both components match only vendor `0x27c0`, product `0x0859`; the helper
+  exclusively opens the mouse usage and the app opens the touchscreen usage.
+- The helper needs Input Monitoring. The app needs Accessibility for Quartz
+  event injection and Input Monitoring for digitizer access.
+- The helper socket is mode 0600 and owned by the active console user.
 - Broker credentials for the optional brightness bridge live only in a
   mode-600 local `config.json` and are excluded from Git.
 
-`RackTouchSeizer` and its mode-0600 Unix-socket bridge remain in the tree as a
-legacy fallback and as a separately compiled regression target. They are not
-part of the current runtime and must not be launched alongside direct capture.
+`RackTouchSeizer` and its mode-0600 Unix-socket bridge are required runtime
+components. Touch Up intentionally does not match the mouse sibling in the
+packaged configuration, preventing dual ownership or a startup race.
 
 ## macOS compatibility risk
 

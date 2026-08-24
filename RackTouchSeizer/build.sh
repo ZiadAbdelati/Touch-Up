@@ -19,6 +19,7 @@ xcrun clang \
   -lpthread \
   -o "$output_dir/rack-touch-seizer"
 
-codesign --force --sign - "$output_dir/rack-touch-seizer"
+signing_identity=${RACK_TOUCH_CODE_SIGN_IDENTITY:--}
+codesign --force --sign "$signing_identity" "$output_dir/rack-touch-seizer"
 codesign --verify --strict "$output_dir/rack-touch-seizer"
 echo "Built $output_dir/rack-touch-seizer"
