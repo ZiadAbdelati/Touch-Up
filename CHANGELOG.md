@@ -1,5 +1,19 @@
 # Changelog
 
+## Cursor recovery hardening — 2026-09-09
+
+- Updated the known remote-console EDID name to `T749-fHD720` and added a
+  main-display/non-rack fallback so adapter name changes cannot preserve a
+  contaminated rack-screen cursor position.
+- Added a multitouch inactivity watchdog that cancels a stale pinch/suppression
+  state and restores normal single-touch input.
+- Made helper-side USB removal close the active report stream so Touch Up resets
+  an interrupted gesture immediately and reconnects cleanly.
+- Added a synchronous shutdown recovery path that restores cursor association,
+  position, and visibility even if delayed restore blocks cannot run.
+- Reset active synthetic state before replacing a digitizer interface during a
+  reconnect race.
+
 ## Reboot startup reliability — 2026-08-24
 
 - Fixed startup when `/dev/console` is temporarily owned by `_windowserver`:
@@ -77,7 +91,7 @@
   stale-contact watchdog.
 - Added Accessibility-aware slider constraints to prevent a drag release from
   dismissing Home Assistant popups.
-- Added automatic mapping to `RTK FHD` and cursor return to `JetKVM v1`.
+- Added automatic mapping to `RTK FHD` and remote-console cursor return.
 - Removed the original hard-coded USB location ID and user UID assumptions.
 - Added helper build/install/uninstall scripts and ignored all generated or
   locally installed binaries.

@@ -99,6 +99,7 @@ static uint16_t gRackMouseLastY = 0;
 static CGFloat gRackMouseStartX = 0.0;
 static CGFloat gRackMouseStartY = 0.0;
 static uint64_t gRackMouseWatchdogGeneration = 0;
+static uint64_t gRackDigitizerWatchdogGeneration = 0;
 static uint64_t gRackMouseHoldGeneration = 0;
 static pthread_t gRackBridgeThread;
 static Boolean gRackBridgeStarted = false;
@@ -654,6 +655,27 @@ static void ScheduleRackMouseReleaseWatchdog(void) {
     });
 }
 
+static void ScheduleRackDigitizerReleaseWatchdog(void) {
+    uint64_t generation = ++gRackDigitizerWatchdogGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != gRackDigitizerWatchdogGeneration ||
+            (!gRackPinching && !gRackSuppressMouseUntilAllContactsUp)) return;
+
+        if (gRackPinching && gTouchManager) {
+            TouchInputManagerCancelRackPinch(gTouchManager);
+        }
+        gRackPinching = false;
+        gRackSuppressMouseUntilAllContactsUp = false;
+        gRackMouseLeftButtonDown = false;
+        gRackMouseDragging = false;
+        gRackMouseLongPressFired = false;
+        gRackMouseHoldGeneration++;
+        fprintf(stderr, "Rack digitizer watchdog cancelled a stale multitouch contact.\n");
+    });
+}
+
 static void ScheduleRackMouseLongPress(uint32_t locationID,
                                        CGFloat x, CGFloat y) {
     uint64_t generation = ++gRackMouseHoldGeneration;
@@ -870,7 +892,10 @@ static Boolean ProcessRackDigitizerInputReport(uint32_t locationID,
     }
 
     if (activeCount == 0) {
+        gRackDigitizerWatchdogGeneration++;
         gRackSuppressMouseUntilAllContactsUp = false;
+    } else if (gRackPinching || gRackSuppressMouseUntilAllContactsUp) {
+        ScheduleRackDigitizerReleaseWatchdog();
     }
     return true;
 }
@@ -960,6 +985,7 @@ static ssize_t ReceiveRackPacket(int socketFD, RackTouchPacket *packet) {
 // from an idle contact state rather than consuming a stale release.
 static void ResetRackMouseGestureState(void) {
     gRackMouseWatchdogGeneration++;
+    gRackDigitizerWatchdogGeneration++;
     gRackMouseHoldGeneration++;
     if (gRackMouseDragging && gTouchManager) {
         TouchInputManagerCancelRackDrag(gTouchManager);
@@ -1352,6 +1378,9 @@ static void Handle_DeviceMatchingCallback(
         // which is all the upper layer keys on, stays connected throughout.
         printf("Switching primary interface for 0x%08x: %ld -> %ld contact collections\n",
                locationID, existing->contactCollectionCount, contactCount);
+        if (IsRackTouchController(inIOHIDDeviceRef)) {
+            ResetRackMouseGestureState();
+        }
         IOHIDDeviceRef oldDev = existing->device;
         IOHIDDeviceRegisterInputValueCallback(oldDev, NULL, NULL);
         DeallocateDeviceState(oldDev);

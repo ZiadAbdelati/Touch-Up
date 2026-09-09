@@ -89,7 +89,16 @@ if "consoleInfo->st_uid < 501" not in source:
     raise SystemExit("helper can publish its socket for an early-boot service account")
 if "account->pw_name[0] == '_'" not in source:
     raise SystemExit("helper does not reject underscore-prefixed service accounts")
+if "ReplaceClient(-1);" not in source:
+    raise SystemExit("helper removal does not reset the active report client")
 PY
+
+grep -q 'Rack digitizer watchdog cancelled a stale multitouch contact' \
+  "$repo_root/TouchUpCore/HIDInterpreter.c"
+grep -q 'RackPreferredRestoreScreen' \
+  "$repo_root/TouchUpCore/TUCTouchInputManager.m"
+grep -q 'RackForceCursorRestore(self)' \
+  "$repo_root/TouchUpCore/TUCTouchInputManager.m"
 
 if python3 -c 'import pytest' >/dev/null 2>&1; then
   (cd "$repo_root/extras/rack-screen-mqtt" && python3 -m pytest tests -q)

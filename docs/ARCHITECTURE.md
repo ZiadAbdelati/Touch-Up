@@ -67,7 +67,11 @@ click-away.
 A 900 ms pre-drag watchdog allows a stationary hold to resolve without leaving
 stale contact state. As soon as dragging begins, the timeout tightens to 300 ms
 so an interrupted report stream cannot leave a synthetic mouse button latched.
-Device removal and app shutdown perform the same gesture-state reset.
+A separate one-second multitouch watchdog cancels a pinch/suppression state if
+the digitizer stops reporting before all contacts lift. Helper-side USB removal
+closes the report stream to trigger the same reset. App shutdown synchronously
+restores cursor association, position, and visibility rather than depending on
+a delayed main-queue block.
 
 ## Screen mapping
 
@@ -75,7 +79,9 @@ Rack reports are recognized by the runtime location ID recorded when the
 digitizer is matched, not a fixed USB-port address. `RTK FHD` bypasses
 upstream aspect-fit correction because its EDID advertises conventional modes
 that do not describe the physical 1280×400 glass. Rotation is still honored.
-Cursor restoration prefers `JetKVM v1`.
+Cursor restoration prefers the tested remote-console EDID name
+`T749-fHD720`. If a KVM, cable, or adapter changes that name, Touch Up falls
+back to the main non-rack display and then any remaining non-rack display.
 
 ## Multitouch investigation
 

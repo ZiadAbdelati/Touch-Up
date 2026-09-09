@@ -43,7 +43,7 @@ does not make this panel multitouch.
 | --- | --- |
 | Touch controller | WCH `27c0:0859` |
 | Rack display | `RTK FHD`, 1280×400 logical points |
-| Cursor-return display | `JetKVM v1` |
+| Cursor-return display | `T749-fHD720`, then the main non-rack display |
 | Raw calibration | X `−92.064…16435.664`, Y `−77.908…9905.108` |
 | macOS architecture | Intel `x86_64` |
 

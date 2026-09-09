@@ -16,6 +16,9 @@ static const CGFloat kRackTopEdgeStartZone = 48.0;
 static const CGFloat kRackTopEdgeRevealDistance = 24.0;
 static const CGFloat kRackTopEdgeApproachInset = 12.0;
 
+static TUCScreen *RackPreferredRestoreScreen(TUCScreen *rackScreen);
+static void RackForceCursorRestore(TUCTouchInputManager *manager);
+
 @interface TUCTouchInputManager ()
 
 @property NSMutableDictionary<NSNumber *, NSNumber *> *frameIDsByLocationID;
@@ -70,12 +73,17 @@ static const CGFloat kRackTopEdgeApproachInset = 12.0;
     // This rack installation intentionally keeps the remote-console pointer on
     // JetKVM whenever Touch Up starts or restarts.
     CGAssociateMouseAndMouseCursorPosition(true);
+    TUCScreen *rackScreen = nil;
     for (TUCScreen *screen in [TUCScreen allScreens]) {
-        if ([screen.name isEqualToString:kRackTouchRestoreDisplayName]) {
-            CGWarpMouseCursorPosition(CGPointMake(CGRectGetMidX(screen.frame),
-                                                  CGRectGetMidY(screen.frame)));
+        if ([screen.name isEqualToString:kRackTouchDisplayName]) {
+            rackScreen = screen;
             break;
         }
+    }
+    TUCScreen *restoreScreen = RackPreferredRestoreScreen(rackScreen);
+    if (restoreScreen) {
+        CGWarpMouseCursorPosition(CGPointMake(CGRectGetMidX(restoreScreen.frame),
+                                              CGRectGetMidY(restoreScreen.frame)));
     }
     CGDisplayShowCursor(kCGNullDirectDisplay);
 
@@ -97,6 +105,7 @@ static const CGFloat kRackTopEdgeApproachInset = 12.0;
 - (void)stop {
     [self cancelRackSyntheticDrag];
     [self cancelRackSyntheticPinch];
+    RackForceCursorRestore(self);
     SetTouchDevicesSeized(false);
     CloseHIDManager();
 }
@@ -866,15 +875,29 @@ static CGPoint RackSafeRestorePoint(TUCTouchInputManager *manager,
     // the bridged report reaches us. If that already displaced the cursor onto
     // the rack panel, restore to the centre of JetKVM instead of saving the
     // contaminated rack coordinate.
-    if (CGRectContainsPoint(rackScreen.frame, savedCursorPoint)) {
-        for (TUCScreen *screen in [TUCScreen allScreens]) {
-            if ([screen.name isEqualToString:kRackTouchRestoreDisplayName]) {
-                restorePoint = CGPointMake(CGRectGetMidX(screen.frame), CGRectGetMidY(screen.frame));
-                break;
-            }
+    if (rackScreen && CGRectContainsPoint(rackScreen.frame, savedCursorPoint)) {
+        TUCScreen *restoreScreen = RackPreferredRestoreScreen(rackScreen);
+        if (restoreScreen) {
+            restorePoint = CGPointMake(CGRectGetMidX(restoreScreen.frame),
+                                       CGRectGetMidY(restoreScreen.frame));
         }
     }
     return restorePoint;
+}
+
+static TUCScreen *RackPreferredRestoreScreen(TUCScreen *rackScreen) {
+    TUCScreen *mainScreen = nil;
+    TUCScreen *firstNonRackScreen = nil;
+    for (TUCScreen *screen in [TUCScreen allScreens]) {
+        if (rackScreen && screen.id == rackScreen.id) continue;
+        if ([screen.name isEqualToString:kRackTouchRestoreDisplayName]) return screen;
+        if (screen.id == CGMainDisplayID()) mainScreen = screen;
+        if (!firstNonRackScreen) firstNonRackScreen = screen;
+    }
+    // Display adapters and KVM firmware can change their EDID product name.
+    // The main non-rack display is the safest fallback, followed by any other
+    // non-rack display, so a contaminated rack coordinate is never retained.
+    return mainScreen ?: firstNonRackScreen;
 }
 
 static pid_t RackWindowPIDAtPoint(CGPoint point) {
@@ -1052,6 +1075,39 @@ static void RackEnsureCursorHidden(TUCTouchInputManager *manager) {
         CGDisplayHideCursor(CGMainDisplayID());
         manager.rackCursorHideBalance += 1;
     }
+}
+
+static void RackForceCursorRestore(TUCTouchInputManager *manager) {
+    // App shutdown can occur before a scheduled 50 ms restore runs. Invalidate
+    // every delayed block, clear synthetic state, restore pointer association,
+    // and drain only the hide requests this manager issued.
+    manager.rackCursorRestoreGeneration += 1;
+    manager.rackSyntheticDragActive = NO;
+    manager.rackSyntheticScrollActive = NO;
+    manager.rackSyntheticPinchActive = NO;
+    manager.rackChromeRevealActive = NO;
+    manager.rackTopEdgeRevealCandidate = NO;
+
+    TUCScreen *rackScreen = nil;
+    for (TUCScreen *screen in [TUCScreen allScreens]) {
+        if ([screen.name isEqualToString:kRackTouchDisplayName]) {
+            rackScreen = screen;
+            break;
+        }
+    }
+    TUCScreen *restoreScreen = RackPreferredRestoreScreen(rackScreen);
+    if (restoreScreen) {
+        CGPoint restorePoint = CGPointMake(CGRectGetMidX(restoreScreen.frame),
+                                           CGRectGetMidY(restoreScreen.frame));
+        CGAssociateMouseAndMouseCursorPosition(true);
+        CGWarpMouseCursorPosition(restorePoint);
+    }
+    while (manager.rackCursorHideBalance > 0) {
+        CGDisplayShowCursor(CGMainDisplayID());
+        manager.rackCursorHideBalance -= 1;
+    }
+    manager.rackCursorHideRequested = NO;
+    fprintf(stderr, "Rack cursor force-restored on stop.\n");
 }
 
 static void RackScheduleCursorRestoreAfter(TUCTouchInputManager *manager,

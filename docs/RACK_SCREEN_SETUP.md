@@ -69,6 +69,9 @@ Inspect the complete installation with:
 9. Unplug/replug the touch USB connection and repeat tap/hold/drag/scroll.
 10. Quit and reopen the app and repeat.
 11. Reboot and verify the delayed launcher, mapping, and cursor restoration.
+12. While touching or dragging, disconnect and reconnect the touchscreen USB.
+    The cursor should return to the remote-console display within one second,
+    and the next tap should work after reconnection.
 
 Pinch is not an acceptance criterion because this controller did not emit
 multitouch frames during testing.

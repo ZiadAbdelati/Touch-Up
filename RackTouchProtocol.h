@@ -20,7 +20,7 @@
 
 #ifdef __OBJC__
 #define kRackTouchDisplayName @"RTK FHD"
-#define kRackTouchRestoreDisplayName @"JetKVM v1"
+#define kRackTouchRestoreDisplayName @"T749-fHD720"
 #endif
 
 typedef struct {

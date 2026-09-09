@@ -354,7 +354,12 @@ static void DeviceRemoved(void *context, IOReturn result, void *sender,
     (void)result;
     (void)sender;
     (void)device;
-    fprintf(stderr, "Rack touchscreen interface disconnected; waiting for reconnect.\n");
+    // The Unix server remains available across USB reconnects, but closing the
+    // active stream makes Touch Up immediately cancel any synthetic gesture
+    // rather than waiting indefinitely for a release report that cannot arrive.
+    ReplaceClient(-1);
+    fprintf(stderr,
+            "Rack touchscreen interface disconnected; reset client and waiting for reconnect.\n");
 }
 
 static void AddNumber(CFMutableDictionaryRef dictionary, CFStringRef key, uint32_t value) {
